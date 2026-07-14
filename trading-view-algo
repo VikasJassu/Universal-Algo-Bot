@@ -82,6 +82,14 @@ tp2PctExit      = input.float(30, "TP2 Exit %", minval=0, maxval=100, group="Tra
 tp3PctExit      = input.float(20, "TP3 Exit % (runner)", minval=0, maxval=100, group="Trade Management")
 useTrailing     = input.bool(true, "Hybrid Trailing (BE at TP1, structure after TP2)", group="Trade Management")
 
+// --- Webhook (Telegram bot integration) ---
+webhookSecret = input.string("telegram123", "Webhook Secret (matches Render env var)", group="Webhook / Telegram", tooltip="Must match WEBHOOK_SECRET env var on your Render bot. Every alert() message is auto-wrapped in JSON with this secret.")
+
+// JSON-wrap helper — TradingView sends the exact string passed to alert() as the webhook body,
+// so we wrap the human-readable text inside JSON that the Render bot expects.
+f_json(msg) =>
+    '{"secret":"' + webhookSecret + '","text":"' + msg + '"}'
+
 // ------------------------- EFFECTIVE VALUES (mode-aware) -------------------------
 // Gold mode uses the original inputs; Crypto/Crude modes swap in their overrides.
 effAtrWickMult   = isCrypto ? cryptoAtrMult    : isCrude ? crudeAtrMult    : atrWickMult
@@ -356,7 +364,7 @@ if longSignal and tradeDir == 0
     tp2Hit := false
     tp3Hit := false
     tradeDir := 1
-    alert("GOLD LONG entry @ " + str.tostring(entryPrice, "#.##") + " | SL " + str.tostring(currentSL, "#.##") + " | TP1 " + str.tostring(tp1Price, "#.##") + " | TP2 " + str.tostring(tp2Price, "#.##") + " | TP3 " + str.tostring(tp3Price, "#.##"), alert.freq_once_per_bar_close)
+    alert(f_json("GOLD LONG entry @ " + str.tostring(entryPrice, "#.##") + " | SL " + str.tostring(currentSL, "#.##") + " | TP1 " + str.tostring(tp1Price, "#.##") + " | TP2 " + str.tostring(tp2Price, "#.##") + " | TP3 " + str.tostring(tp3Price, "#.##")), alert.freq_once_per_bar_close)
 
 // --- Open SHORT ---
 if shortSignal and tradeDir == 0
@@ -377,7 +385,7 @@ if shortSignal and tradeDir == 0
     tp2Hit := false
     tp3Hit := false
     tradeDir := -1
-    alert("GOLD SHORT entry @ " + str.tostring(entryPrice, "#.##") + " | SL " + str.tostring(currentSL, "#.##") + " | TP1 " + str.tostring(tp1Price, "#.##") + " | TP2 " + str.tostring(tp2Price, "#.##") + " | TP3 " + str.tostring(tp3Price, "#.##"), alert.freq_once_per_bar_close)
+    alert(f_json("GOLD SHORT entry @ " + str.tostring(entryPrice, "#.##") + " | SL " + str.tostring(currentSL, "#.##") + " | TP1 " + str.tostring(tp1Price, "#.##") + " | TP2 " + str.tostring(tp2Price, "#.##") + " | TP3 " + str.tostring(tp3Price, "#.##")), alert.freq_once_per_bar_close)
 
 // --- Manage active LONG ---
 if tradeDir == 1
@@ -389,7 +397,7 @@ if tradeDir == 1
             line.set_y1(slLine, currentSL)
             line.set_y2(slLine, currentSL)
             label.new(bar_index, currentSL, "SL → BE", style=label.style_label_left, color=color.yellow, textcolor=color.black, size=size.tiny)
-        alert("GOLD LONG TP1 hit @ " + str.tostring(tp1Price, "#.##") + " — exit " + str.tostring(tp1PctExit, "#") + "%, move SL to BE", alert.freq_once_per_bar_close)
+        alert(f_json("GOLD LONG TP1 hit @ " + str.tostring(tp1Price, "#.##") + " — exit " + str.tostring(tp1PctExit, "#") + "%, move SL to BE"), alert.freq_once_per_bar_close)
     if not tp2Hit and high >= tp2Price
         tp2Hit := true
         label.new(bar_index, tp2Price, "TP2 HIT — Exit " + str.tostring(tp2PctExit, "#") + "%", style=label.style_label_down, color=color.lime, textcolor=color.black, size=size.tiny)
@@ -398,7 +406,7 @@ if tradeDir == 1
             line.set_y1(slLine, currentSL)
             line.set_y2(slLine, currentSL)
             label.new(bar_index, currentSL, "SL → Structure", style=label.style_label_left, color=color.yellow, textcolor=color.black, size=size.tiny)
-        alert("GOLD LONG TP2 hit @ " + str.tostring(tp2Price, "#.##") + " — exit " + str.tostring(tp2PctExit, "#") + "%, trail SL to structure", alert.freq_once_per_bar_close)
+        alert(f_json("GOLD LONG TP2 hit @ " + str.tostring(tp2Price, "#.##") + " — exit " + str.tostring(tp2PctExit, "#") + "%, trail SL to structure"), alert.freq_once_per_bar_close)
     if tp2Hit and useTrailing and not na(lastPLchart) and lastPLchart > currentSL and lastPLchart < close
         currentSL := lastPLchart
         line.set_y1(slLine, currentSL)
@@ -406,7 +414,7 @@ if tradeDir == 1
     if not tp3Hit and high >= tp3Price
         tp3Hit := true
         label.new(bar_index, tp3Price, "TP3 HIT — Exit runner " + str.tostring(tp3PctExit, "#") + "%", style=label.style_label_down, color=color.lime, textcolor=color.black, size=size.small)
-        alert("GOLD LONG TP3 hit @ " + str.tostring(tp3Price, "#.##") + " — close remaining " + str.tostring(tp3PctExit, "#") + "%", alert.freq_once_per_bar_close)
+        alert(f_json("GOLD LONG TP3 hit @ " + str.tostring(tp3Price, "#.##") + " — close remaining " + str.tostring(tp3PctExit, "#") + "%"), alert.freq_once_per_bar_close)
         line.delete(entryLine)
         line.delete(slLine)
         line.delete(tp1Line)
@@ -416,7 +424,7 @@ if tradeDir == 1
         tradeDir := 0
     if tradeDir == 1 and low <= currentSL
         label.new(bar_index, currentSL, tp1Hit ? "Trail Exit" : "SL HIT", style=label.style_label_up, color=color.red, textcolor=color.white, size=size.small)
-        alert("GOLD LONG " + (tp1Hit ? "trail exit" : "STOP hit") + " @ " + str.tostring(currentSL, "#.##"), alert.freq_once_per_bar_close)
+        alert(f_json("GOLD LONG " + (tp1Hit ? "trail exit" : "STOP hit") + " @ " + str.tostring(currentSL, "#.##")), alert.freq_once_per_bar_close)
         line.delete(entryLine)
         line.delete(slLine)
         line.delete(tp1Line)
@@ -435,7 +443,7 @@ if tradeDir == -1
             line.set_y1(slLine, currentSL)
             line.set_y2(slLine, currentSL)
             label.new(bar_index, currentSL, "SL → BE", style=label.style_label_left, color=color.yellow, textcolor=color.black, size=size.tiny)
-        alert("GOLD SHORT TP1 hit @ " + str.tostring(tp1Price, "#.##") + " — exit " + str.tostring(tp1PctExit, "#") + "%, move SL to BE", alert.freq_once_per_bar_close)
+        alert(f_json("GOLD SHORT TP1 hit @ " + str.tostring(tp1Price, "#.##") + " — exit " + str.tostring(tp1PctExit, "#") + "%, move SL to BE"), alert.freq_once_per_bar_close)
     if not tp2Hit and low <= tp2Price
         tp2Hit := true
         label.new(bar_index, tp2Price, "TP2 HIT — Exit " + str.tostring(tp2PctExit, "#") + "%", style=label.style_label_up, color=color.lime, textcolor=color.black, size=size.tiny)
@@ -444,7 +452,7 @@ if tradeDir == -1
             line.set_y1(slLine, currentSL)
             line.set_y2(slLine, currentSL)
             label.new(bar_index, currentSL, "SL → Structure", style=label.style_label_left, color=color.yellow, textcolor=color.black, size=size.tiny)
-        alert("GOLD SHORT TP2 hit @ " + str.tostring(tp2Price, "#.##") + " — exit " + str.tostring(tp2PctExit, "#") + "%, trail SL to structure", alert.freq_once_per_bar_close)
+        alert(f_json("GOLD SHORT TP2 hit @ " + str.tostring(tp2Price, "#.##") + " — exit " + str.tostring(tp2PctExit, "#") + "%, trail SL to structure"), alert.freq_once_per_bar_close)
     if tp2Hit and useTrailing and not na(lastPHchart) and lastPHchart < currentSL and lastPHchart > close
         currentSL := lastPHchart
         line.set_y1(slLine, currentSL)
@@ -452,7 +460,7 @@ if tradeDir == -1
     if not tp3Hit and low <= tp3Price
         tp3Hit := true
         label.new(bar_index, tp3Price, "TP3 HIT — Exit runner " + str.tostring(tp3PctExit, "#") + "%", style=label.style_label_up, color=color.lime, textcolor=color.black, size=size.small)
-        alert("GOLD SHORT TP3 hit @ " + str.tostring(tp3Price, "#.##") + " — close remaining " + str.tostring(tp3PctExit, "#") + "%", alert.freq_once_per_bar_close)
+        alert(f_json("GOLD SHORT TP3 hit @ " + str.tostring(tp3Price, "#.##") + " — close remaining " + str.tostring(tp3PctExit, "#") + "%"), alert.freq_once_per_bar_close)
         line.delete(entryLine)
         line.delete(slLine)
         line.delete(tp1Line)
@@ -462,7 +470,7 @@ if tradeDir == -1
         tradeDir := 0
     if tradeDir == -1 and high >= currentSL
         label.new(bar_index, currentSL, tp1Hit ? "Trail Exit" : "SL HIT", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
-        alert("GOLD SHORT " + (tp1Hit ? "trail exit" : "STOP hit") + " @ " + str.tostring(currentSL, "#.##"), alert.freq_once_per_bar_close)
+        alert(f_json("GOLD SHORT " + (tp1Hit ? "trail exit" : "STOP hit") + " @ " + str.tostring(currentSL, "#.##")), alert.freq_once_per_bar_close)
         line.delete(entryLine)
         line.delete(slLine)
         line.delete(tp1Line)

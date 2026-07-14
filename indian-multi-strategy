@@ -1,0 +1,424 @@
+//@version=6
+indicator("Indian Intraday Multi-Strategy (ORB + VWAP + EMA + Sweep)", overlay=true, max_lines_count=500, max_labels_count=500, max_bars_back=500)
+
+// ============================================================
+// Indian intraday multi-strategy indicator
+// Combines 4 mechanical strategies with unified SL / TP1-2-3 / partial exits.
+// Strategies:
+//   1) ORB — Opening Range Breakout (9:15–9:30 IST default)
+//   2) VWAP + Previous Day High/Low reversal
+//   3) EMA Momentum (9/21 pullback)
+//   4) Liquidity Sweep (simplified — for full version use gold-crypto indicator)
+// Best on: Bank Nifty, Nifty 50, Sensex, top-20 large-cap stocks
+// Recommended chart timeframe: 5m
+// ============================================================
+
+// ------------------------- INPUTS: MARKET MODE -------------------------
+marketMode = input.string("Stocks", "Market Mode", options=["Stocks","MCX Crude"], group="Market Mode", tooltip="Stocks = Nifty/Bank Nifty/Sensex/equity intraday (9:15-15:30 IST). MCX Crude = CRUDEOILM/CRUDEOIL with dual-session ORB (9 AM + 5 PM)")
+isMCXCrude = marketMode == "MCX Crude"
+
+// ------------------------- INPUTS: STRATEGIES -------------------------
+useORB   = input.bool(true, "Enable ORB Strategy",         group="Strategies")
+useVWAP  = input.bool(true, "Enable VWAP + PDH/PDL",       group="Strategies")
+useEMA   = input.bool(true, "Enable EMA Momentum",         group="Strategies")
+useSweep = input.bool(true, "Enable Liquidity Sweep",      group="Strategies")
+
+// ------------------------- INPUTS: SESSION -------------------------
+sessionStr    = input.session("0915-1530", "Indian Market Session (IST)", group="Session")
+lunchStr      = input.session("1200-1330", "Lunch — no trades (IST)",     group="Session")
+skipFirst15   = input.bool(true, "Skip First 15 Min (post-gap chop)",     group="Session")
+skipLast15    = input.bool(true, "Skip Last 15 Min (auction volatility)", group="Session")
+
+// ------------------------- INPUTS: ORB -------------------------
+orbMinutes     = input.int(15,  "ORB Range Duration (mins)", minval=5, maxval=60, group="ORB")
+orbMaxRangePct = input.float(1.0, "Skip If Range > % of Price", step=0.1, group="ORB")
+orbTPmult      = input.float(1.5, "TP2 = Range × N", step=0.1, group="ORB")
+
+// ------------------------- INPUTS: VWAP -------------------------
+pdhTolPct = input.float(0.15, "PDH/PDL Rejection Tolerance %", step=0.05, group="VWAP + PDH/PDL")
+
+// ------------------------- INPUTS: EMA -------------------------
+emaFast = input.int(9,  "Fast EMA", minval=2, group="EMA Momentum")
+emaSlow = input.int(21, "Slow EMA", minval=5, group="EMA Momentum")
+
+// ------------------------- INPUTS: SWEEP -------------------------
+pivotLR    = input.int(5, "Pivot Bars (L=R)", minval=1, group="Liquidity Sweep")
+sweepAtrX  = input.float(0.5, "Min Sweep Wick × ATR", step=0.1, group="Liquidity Sweep")
+
+// ------------------------- INPUTS: COMMON -------------------------
+atrLen        = input.int(14,  "ATR Length", group="Common")
+slAtrMult     = input.float(0.5, "SL Buffer × ATR", step=0.1, group="Trade Management")
+tp1R          = input.float(1,   "TP1 (R multiple)", step=0.25, group="Trade Management")
+tp2R          = input.float(2,   "TP2 (R multiple, fallback)", step=0.25, group="Trade Management")
+tp3R          = input.float(3,   "TP3 (R multiple, fallback)", step=0.25, group="Trade Management")
+tp1Pct        = input.float(50,  "TP1 Exit %", minval=0, maxval=100, group="Trade Management")
+tp2Pct        = input.float(30,  "TP2 Exit %", minval=0, maxval=100, group="Trade Management")
+tp3Pct        = input.float(20,  "TP3 Exit %", minval=0, maxval=100, group="Trade Management")
+
+// --- Webhook (Telegram bot integration) ---
+webhookSecret = input.string("telegram123", "Webhook Secret (matches Render env var)", group="Webhook / Telegram", tooltip="Must match WEBHOOK_SECRET env var on your Render bot. Every alert() message is auto-wrapped in JSON with this secret.")
+
+// JSON-wrap helper — Pine's alert() message is what TradingView sends as webhook body
+f_json(msg) =>
+    '{"secret":"' + webhookSecret + '","text":"' + msg + '"}'
+
+// ------------------------- EFFECTIVE VALUES (mode-aware) -------------------------
+// MCX Crude uses wider tolerances, 30-min ORB, dual-session, no lunch break
+effSessionStr    = isMCXCrude ? "0900-2330" : sessionStr
+effLunchStr      = isMCXCrude ? "0000-0001" : lunchStr   // effectively disable lunch for crude
+effOrbMinutes    = isMCXCrude ? 30 : orbMinutes
+effOrbMaxRange   = isMCXCrude ? 2.0 : orbMaxRangePct
+effPdhTol        = isMCXCrude ? 0.25 : pdhTolPct
+effSlAtrBuffer   = isMCXCrude ? 0.7 : slAtrMult
+effSkipFirst15   = isMCXCrude ? false : skipFirst15
+effSkipLast15    = isMCXCrude ? false : skipLast15
+
+// ------------------------- TIME / SESSION -------------------------
+inSession = not na(time(timeframe.period, effSessionStr, "Asia/Kolkata"))
+inLunch   = not na(time(timeframe.period, effLunchStr,   "Asia/Kolkata"))
+
+istH = hour(time, "Asia/Kolkata")
+istM = minute(time, "Asia/Kolkata")
+
+// Skip-first / skip-last windows (stocks only — crude opens cleanly)
+nearOpen  = effSkipFirst15 and istH == 9 and istM >= 15 and istM < 30
+nearClose = effSkipLast15  and istH == 15 and istM >= 15
+tradable  = inSession and not inLunch and not nearOpen and not nearClose
+
+newDay = ta.change(time("D")) != 0
+
+// MCX Crude dual-session ORB reset (fires at start of 9 AM AND 5 PM sessions)
+mcxMorningReset = isMCXCrude and istH == 9  and istH[1] != 9
+mcxEveningReset = isMCXCrude and istH == 17 and istH[1] != 17
+
+// ------------------------- PREVIOUS DAY HIGH / LOW -------------------------
+var float pdhVal = na
+var float pdlVal = na
+var float dayH   = na
+var float dayL   = na
+
+if newDay
+    pdhVal := dayH
+    pdlVal := dayL
+    dayH := high
+    dayL := low
+else
+    dayH := math.max(nz(dayH, high), high)
+    dayL := math.min(nz(dayL, low), low)
+
+var line pdhLine = na
+var line pdlLine = na
+if newDay
+    line.delete(pdhLine)
+    line.delete(pdlLine)
+    if not na(pdhVal)
+        pdhLine := line.new(bar_index, pdhVal, bar_index+1, pdhVal, extend=extend.right, color=color.new(color.red, 30),   width=1, style=line.style_dashed)
+        label.new(bar_index, pdhVal, "PDH", style=label.style_label_left, color=color.new(color.red, 20), textcolor=color.white, size=size.tiny)
+    if not na(pdlVal)
+        pdlLine := line.new(bar_index, pdlVal, bar_index+1, pdlVal, extend=extend.right, color=color.new(color.green, 30), width=1, style=line.style_dashed)
+        label.new(bar_index, pdlVal, "PDL", style=label.style_label_left, color=color.new(color.green, 20), textcolor=color.white, size=size.tiny)
+
+// ------------------------- OPENING RANGE (ORB) -------------------------
+// Bars-based tracking works for both stocks (single ORB) and crude (dual ORB).
+var float orbHigh       = na
+var float orbLow        = na
+var int   orbStartBar   = na
+var bool  orbLocked     = false
+var bool  orbLongTaken  = false
+var bool  orbShortTaken = false
+var line  orbHiLn       = na
+var line  orbLoLn       = na
+
+// Reset ORB at session start (new day for stocks; new day OR 5 PM for crude)
+resetORB = newDay or mcxMorningReset or mcxEveningReset
+if resetORB
+    orbHigh := na
+    orbLow := na
+    orbStartBar := bar_index
+    orbLocked := false
+    orbLongTaken := false
+    orbShortTaken := false
+    line.delete(orbHiLn)
+    line.delete(orbLoLn)
+    orbHiLn := na
+    orbLoLn := na
+
+// Convert ORB minutes to bars based on chart timeframe
+orbDurationBars = math.max(1, int(math.ceil(effOrbMinutes * 60 / math.max(timeframe.in_seconds(), 60))))
+orbBarsElapsed  = not na(orbStartBar) ? bar_index - orbStartBar : -1
+
+if useORB and not orbLocked and not na(orbStartBar) and orbBarsElapsed >= 0
+    if orbBarsElapsed < orbDurationBars
+        orbHigh := math.max(nz(orbHigh, high), high)
+        orbLow  := math.min(nz(orbLow, low), low)
+    if orbBarsElapsed >= orbDurationBars and not na(orbHigh) and not na(orbLow)
+        orbLocked := true
+        orbHiLn := line.new(orbStartBar, orbHigh, bar_index+1, orbHigh, extend=extend.right, color=color.yellow, width=1, style=line.style_dotted)
+        orbLoLn := line.new(orbStartBar, orbLow,  bar_index+1, orbLow,  extend=extend.right, color=color.yellow, width=1, style=line.style_dotted)
+        orbLabel = isMCXCrude and istH >= 17 ? "Evening ORB" : "ORB"
+        label.new(bar_index, orbHigh, orbLabel + " High", style=label.style_label_left, color=color.new(color.yellow, 30), textcolor=color.black, size=size.tiny)
+        label.new(bar_index, orbLow,  orbLabel + " Low",  style=label.style_label_left, color=color.new(color.yellow, 30), textcolor=color.black, size=size.tiny)
+
+// ------------------------- VWAP & EMAs -------------------------
+vwapVal = ta.vwap(hlc3)
+emaF    = ta.ema(close, emaFast)
+emaS    = ta.ema(close, emaSlow)
+atrVal  = ta.atr(atrLen)
+
+plot(useVWAP ? vwapVal : na, "VWAP",   color=color.new(color.yellow, 20), linewidth=2)
+plot(useEMA  ? emaF    : na, "9 EMA",  color=color.new(color.aqua, 30))
+plot(useEMA  ? emaS    : na, "21 EMA", color=color.new(color.orange, 30))
+
+// ------------------------- STRATEGY 1: ORB SIGNALS -------------------------
+orbRangeSize = orbLocked ? (orbHigh - orbLow) : na
+orbRangeOK   = orbLocked and (orbRangeSize / close) < (effOrbMaxRange / 100)
+
+orbLongSig  = useORB and tradable and orbRangeOK and not orbLongTaken and close > orbHigh and close[1] <= orbHigh
+orbShortSig = useORB and tradable and orbRangeOK and not orbShortTaken and close < orbLow  and close[1] >= orbLow
+
+if orbLongSig
+    orbLongTaken := true
+if orbShortSig
+    orbShortTaken := true
+
+// ------------------------- STRATEGY 2: VWAP + PDH/PDL REVERSAL -------------------------
+pdhTol = not na(pdhVal) ? pdhVal * effPdhTol / 100 : 0.0
+pdlTol = not na(pdlVal) ? pdlVal * effPdhTol / 100 : 0.0
+
+pdlBounce  = not na(pdlVal) and low  <= pdlVal + pdlTol and close > pdlVal
+pdhReject  = not na(pdhVal) and high >= pdhVal - pdhTol and close < pdhVal
+
+vwapLongSig  = useVWAP and tradable and pdlBounce and close > vwapVal
+vwapShortSig = useVWAP and tradable and pdhReject and close < vwapVal
+
+// ------------------------- STRATEGY 3: EMA MOMENTUM -------------------------
+emaBull   = emaF > emaS and emaS > emaS[3]
+emaBear   = emaF < emaS and emaS < emaS[3]
+pullbackL = low  <= emaF and close > emaF and close > open
+pullbackS = high >= emaF and close < emaF and close < open
+
+emaLongSig  = useEMA and tradable and emaBull and pullbackL
+emaShortSig = useEMA and tradable and emaBear and pullbackS
+
+// ------------------------- STRATEGY 4: LIQUIDITY SWEEP -------------------------
+ph = ta.pivothigh(high, pivotLR, pivotLR)
+pl = ta.pivotlow(low,   pivotLR, pivotLR)
+var float lastPH = na
+var float lastPL = na
+if not na(ph)
+    lastPH := ph
+if not na(pl)
+    lastPL := pl
+
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+wickUpOK  = upperWick >= atrVal * sweepAtrX
+wickDnOK  = lowerWick >= atrVal * sweepAtrX
+
+sweepBearRaw = useSweep and tradable and not na(lastPH) and high > lastPH and close < lastPH and wickUpOK
+sweepBullRaw = useSweep and tradable and not na(lastPL) and low  < lastPL and close > lastPL and wickDnOK
+
+sweepLongSig  = sweepBullRaw
+sweepShortSig = sweepBearRaw
+
+// ------------------------- COMBINED SIGNALS -------------------------
+longSig  = orbLongSig  or vwapLongSig  or emaLongSig  or sweepLongSig
+shortSig = orbShortSig or vwapShortSig or emaShortSig or sweepShortSig
+
+// ------------------------- TRADE STATE -------------------------
+var int    tradeDir      = 0
+var float  entryP        = na
+var float  slP           = na
+var float  tp1P          = na
+var float  tp2P          = na
+var float  tp3P          = na
+var bool   tp1Hit        = false
+var bool   tp2Hit        = false
+var line   entryLn       = na
+var line   slLn          = na
+var line   tp1Ln         = na
+var line   tp2Ln         = na
+var line   tp3Ln         = na
+var label  entryLbl      = na
+var string sName         = ""
+
+// ------------------------- END-OF-DAY / NEW-DAY TRADE CLEANUP -------------------------
+// Force-close any open trade at end of session so overnight/next-day price
+// doesn't retroactively "hit" old TP/SL levels.
+sessionEnded = not inSession and inSession[1]  // just left session (true → false transition)
+if (newDay or sessionEnded) and tradeDir != 0
+    label.new(bar_index, entryP, "EOD Force-Close (" + sName + ")", style=label.style_label_left, color=color.gray, textcolor=color.white, size=size.tiny)
+    alert(f_json("INDIAN " + sName + " force-closed at EOD @ " + str.tostring(close, "#.##")), alert.freq_once_per_bar_close)
+    line.delete(entryLn)
+    line.delete(slLn)
+    line.delete(tp1Ln)
+    line.delete(tp2Ln)
+    line.delete(tp3Ln)
+    label.delete(entryLbl)
+    tradeDir := 0
+    tp1Hit := false
+    tp2Hit := false
+    entryP := na
+    slP := na
+    tp1P := na
+    tp2P := na
+    tp3P := na
+    sName := ""
+
+// --- OPEN LONG ---
+if longSig and tradeDir == 0
+    entryP := close
+    slBase = orbLongSig ? orbLow : low
+    slP    := slBase - atrVal * effSlAtrBuffer
+    risk   = entryP - slP
+    orbTgt = orbLongSig and not na(orbRangeSize) ? entryP + orbRangeSize * orbTPmult : na
+    tp1P   := entryP + risk * tp1R
+    tp2P   := not na(orbTgt) and orbTgt > tp1P ? orbTgt : entryP + risk * tp2R
+    tp3P   := not na(pdhVal) and pdhVal > tp2P ? pdhVal : entryP + risk * tp3R
+    sName  := orbLongSig ? "ORB" : vwapLongSig ? "VWAP" : emaLongSig ? "EMA" : "SWEEP"
+    entryLn := line.new(bar_index, entryP, bar_index+1, entryP, extend=extend.right, color=color.white, width=1)
+    slLn    := line.new(bar_index, slP,    bar_index+1, slP,    extend=extend.right, color=color.red,   width=2, style=line.style_dashed)
+    tp1Ln   := line.new(bar_index, tp1P,   bar_index+1, tp1P,   extend=extend.right, color=color.lime,  width=1, style=line.style_dotted)
+    tp2Ln   := line.new(bar_index, tp2P,   bar_index+1, tp2P,   extend=extend.right, color=color.lime,  width=1, style=line.style_dotted)
+    tp3Ln   := line.new(bar_index, tp3P,   bar_index+1, tp3P,   extend=extend.right, color=color.lime,  width=2, style=line.style_dotted)
+    txt = sName + " LONG @ " + str.tostring(entryP, "#.##") + "\nSL " + str.tostring(slP, "#.##") + "\nTP1 (" + str.tostring(tp1Pct, "#") + "%) " + str.tostring(tp1P, "#.##") + "\nTP2 (" + str.tostring(tp2Pct, "#") + "%) " + str.tostring(tp2P, "#.##") + "\nTP3 (" + str.tostring(tp3Pct, "#") + "%) " + str.tostring(tp3P, "#.##")
+    entryLbl := label.new(bar_index, entryP, txt, style=label.style_label_right, color=color.new(color.green, 15), textcolor=color.white, size=size.small)
+    tp1Hit := false
+    tp2Hit := false
+    tradeDir := 1
+    alert(f_json("INDIAN " + sName + " LONG @ " + str.tostring(entryP, "#.##") + " | SL " + str.tostring(slP, "#.##") + " | TP1 " + str.tostring(tp1P, "#.##") + " | TP2 " + str.tostring(tp2P, "#.##") + " | TP3 " + str.tostring(tp3P, "#.##")), alert.freq_once_per_bar_close)
+
+// --- OPEN SHORT ---
+if shortSig and tradeDir == 0
+    entryP := close
+    slBase = orbShortSig ? orbHigh : high
+    slP    := slBase + atrVal * effSlAtrBuffer
+    risk   = slP - entryP
+    orbTgt = orbShortSig and not na(orbRangeSize) ? entryP - orbRangeSize * orbTPmult : na
+    tp1P   := entryP - risk * tp1R
+    tp2P   := not na(orbTgt) and orbTgt < tp1P ? orbTgt : entryP - risk * tp2R
+    tp3P   := not na(pdlVal) and pdlVal < tp2P ? pdlVal : entryP - risk * tp3R
+    sName  := orbShortSig ? "ORB" : vwapShortSig ? "VWAP" : emaShortSig ? "EMA" : "SWEEP"
+    entryLn := line.new(bar_index, entryP, bar_index+1, entryP, extend=extend.right, color=color.white, width=1)
+    slLn    := line.new(bar_index, slP,    bar_index+1, slP,    extend=extend.right, color=color.red,   width=2, style=line.style_dashed)
+    tp1Ln   := line.new(bar_index, tp1P,   bar_index+1, tp1P,   extend=extend.right, color=color.lime,  width=1, style=line.style_dotted)
+    tp2Ln   := line.new(bar_index, tp2P,   bar_index+1, tp2P,   extend=extend.right, color=color.lime,  width=1, style=line.style_dotted)
+    tp3Ln   := line.new(bar_index, tp3P,   bar_index+1, tp3P,   extend=extend.right, color=color.lime,  width=2, style=line.style_dotted)
+    txt = sName + " SHORT @ " + str.tostring(entryP, "#.##") + "\nSL " + str.tostring(slP, "#.##") + "\nTP1 (" + str.tostring(tp1Pct, "#") + "%) " + str.tostring(tp1P, "#.##") + "\nTP2 (" + str.tostring(tp2Pct, "#") + "%) " + str.tostring(tp2P, "#.##") + "\nTP3 (" + str.tostring(tp3Pct, "#") + "%) " + str.tostring(tp3P, "#.##")
+    entryLbl := label.new(bar_index, entryP, txt, style=label.style_label_right, color=color.new(color.red, 15), textcolor=color.white, size=size.small)
+    tp1Hit := false
+    tp2Hit := false
+    tradeDir := -1
+    alert(f_json("INDIAN " + sName + " SHORT @ " + str.tostring(entryP, "#.##") + " | SL " + str.tostring(slP, "#.##") + " | TP1 " + str.tostring(tp1P, "#.##") + " | TP2 " + str.tostring(tp2P, "#.##") + " | TP3 " + str.tostring(tp3P, "#.##")), alert.freq_once_per_bar_close)
+
+// --- MANAGE LONG ---
+if tradeDir == 1
+    if not tp1Hit and high >= tp1P
+        tp1Hit := true
+        label.new(bar_index, tp1P, "TP1 — Exit " + str.tostring(tp1Pct, "#") + "%", style=label.style_label_down, color=color.lime, textcolor=color.black, size=size.tiny)
+        slP := entryP
+        line.set_y1(slLn, slP)
+        line.set_y2(slLn, slP)
+        alert(f_json(sName + " LONG TP1 @ " + str.tostring(tp1P, "#.##") + " — exit " + str.tostring(tp1Pct, "#") + "%, SL→BE"), alert.freq_once_per_bar_close)
+    if not tp2Hit and high >= tp2P
+        tp2Hit := true
+        label.new(bar_index, tp2P, "TP2 — Exit " + str.tostring(tp2Pct, "#") + "%", style=label.style_label_down, color=color.lime, textcolor=color.black, size=size.tiny)
+        alert(f_json(sName + " LONG TP2 @ " + str.tostring(tp2P, "#.##") + " — exit " + str.tostring(tp2Pct, "#") + "%"), alert.freq_once_per_bar_close)
+    if high >= tp3P
+        label.new(bar_index, tp3P, "TP3 — Exit " + str.tostring(tp3Pct, "#") + "%", style=label.style_label_down, color=color.lime, textcolor=color.black, size=size.small)
+        alert(f_json(sName + " LONG TP3 @ " + str.tostring(tp3P, "#.##") + " — close all"), alert.freq_once_per_bar_close)
+        line.delete(entryLn)
+        line.delete(slLn)
+        line.delete(tp1Ln)
+        line.delete(tp2Ln)
+        line.delete(tp3Ln)
+        label.delete(entryLbl)
+        tradeDir := 0
+    if tradeDir == 1 and low <= slP
+        label.new(bar_index, slP, tp1Hit ? "Trail Exit" : "SL HIT", style=label.style_label_up, color=color.red, textcolor=color.white, size=size.small)
+        alert(f_json(sName + " LONG " + (tp1Hit ? "trail exit" : "SL") + " @ " + str.tostring(slP, "#.##")), alert.freq_once_per_bar_close)
+        line.delete(entryLn)
+        line.delete(slLn)
+        line.delete(tp1Ln)
+        line.delete(tp2Ln)
+        line.delete(tp3Ln)
+        label.delete(entryLbl)
+        tradeDir := 0
+
+// --- MANAGE SHORT ---
+if tradeDir == -1
+    if not tp1Hit and low <= tp1P
+        tp1Hit := true
+        label.new(bar_index, tp1P, "TP1 — Exit " + str.tostring(tp1Pct, "#") + "%", style=label.style_label_up, color=color.lime, textcolor=color.black, size=size.tiny)
+        slP := entryP
+        line.set_y1(slLn, slP)
+        line.set_y2(slLn, slP)
+        alert(f_json(sName + " SHORT TP1 @ " + str.tostring(tp1P, "#.##") + " — exit " + str.tostring(tp1Pct, "#") + "%, SL→BE"), alert.freq_once_per_bar_close)
+    if not tp2Hit and low <= tp2P
+        tp2Hit := true
+        label.new(bar_index, tp2P, "TP2 — Exit " + str.tostring(tp2Pct, "#") + "%", style=label.style_label_up, color=color.lime, textcolor=color.black, size=size.tiny)
+        alert(f_json(sName + " SHORT TP2 @ " + str.tostring(tp2P, "#.##") + " — exit " + str.tostring(tp2Pct, "#") + "%"), alert.freq_once_per_bar_close)
+    if low <= tp3P
+        label.new(bar_index, tp3P, "TP3 — Exit " + str.tostring(tp3Pct, "#") + "%", style=label.style_label_up, color=color.lime, textcolor=color.black, size=size.small)
+        alert(f_json(sName + " SHORT TP3 @ " + str.tostring(tp3P, "#.##") + " — close all"), alert.freq_once_per_bar_close)
+        line.delete(entryLn)
+        line.delete(slLn)
+        line.delete(tp1Ln)
+        line.delete(tp2Ln)
+        line.delete(tp3Ln)
+        label.delete(entryLbl)
+        tradeDir := 0
+    if tradeDir == -1 and high >= slP
+        label.new(bar_index, slP, tp1Hit ? "Trail Exit" : "SL HIT", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+        alert(f_json(sName + " SHORT " + (tp1Hit ? "trail exit" : "SL") + " @ " + str.tostring(slP, "#.##")), alert.freq_once_per_bar_close)
+        line.delete(entryLn)
+        line.delete(slLn)
+        line.delete(tp1Ln)
+        line.delete(tp2Ln)
+        line.delete(tp3Ln)
+        label.delete(entryLbl)
+        tradeDir := 0
+
+// ------------------------- BACKGROUND & VISUAL AIDS -------------------------
+bgcolor(inSession and inLunch ? color.new(color.red, 92) : tradable ? color.new(color.green, 95) : na)
+
+// ------------------------- STATUS TABLE -------------------------
+var table t = table.new(position.top_right, 2, 8, bgcolor=color.new(color.black, 70), border_width=1)
+if barstate.islast
+    sessStr = not inSession ? "CLOSED" : inLunch ? "LUNCH" : nearOpen ? "OPEN CHOP" : nearClose ? "CLOSE CHOP" : "TRADE"
+    sessCol = tradable ? color.lime : color.gray
+    orbStr  = not orbLocked ? "Building..." : "Range: " + str.tostring(orbRangeSize, "#.##")
+    orbCol  = orbLocked and orbRangeOK ? color.yellow : color.gray
+    trendStr = emaBull ? "BULL" : emaBear ? "BEAR" : "FLAT"
+    trendCol = emaBull ? color.lime : emaBear ? color.red : color.gray
+    vwapStr  = close > vwapVal ? "ABOVE" : "BELOW"
+    vwapCol  = close > vwapVal ? color.lime : color.red
+    tradeStr = tradeDir == 1 ? sName + " LONG" : tradeDir == -1 ? sName + " SHORT" : "FLAT"
+    tradeCol = tradeDir == 1 ? color.lime : tradeDir == -1 ? color.red : color.gray
+    progStr  = tradeDir == 0 ? "-" : tp2Hit ? "TP2 hit" : tp1Hit ? "TP1 hit" : "Open"
+    table.cell(t, 0, 0, "Mode",     text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 0, marketMode, text_color=isMCXCrude ? color.orange : color.aqua, text_size=size.small)
+    table.cell(t, 0, 1, "Session",  text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 1, sessStr,    text_color=sessCol,     text_size=size.small)
+    table.cell(t, 0, 2, "ORB",      text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 2, orbStr,     text_color=orbCol,      text_size=size.small)
+    table.cell(t, 0, 3, "VWAP",     text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 3, vwapStr,    text_color=vwapCol,     text_size=size.small)
+    table.cell(t, 0, 4, "EMA",      text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 4, trendStr,   text_color=trendCol,    text_size=size.small)
+    table.cell(t, 0, 5, "ATR",      text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 5, str.tostring(atrVal, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 6, "Trade",    text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 6, tradeStr,   text_color=tradeCol,    text_size=size.small)
+    table.cell(t, 0, 7, "Progress", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 7, progStr,    text_color=color.white, text_size=size.small)
+
+// ------------------------- ALERT CONDITIONS -------------------------
+alertcondition(orbLongSig,   "ORB Long",    "ORB Breakout LONG on {{ticker}}")
+alertcondition(orbShortSig,  "ORB Short",   "ORB Breakdown SHORT on {{ticker}}")
+alertcondition(vwapLongSig,  "VWAP Long",   "VWAP+PDL bounce LONG on {{ticker}}")
+alertcondition(vwapShortSig, "VWAP Short",  "VWAP+PDH reject SHORT on {{ticker}}")
+alertcondition(emaLongSig,   "EMA Long",    "EMA pullback LONG on {{ticker}}")
+alertcondition(emaShortSig,  "EMA Short",   "EMA pullback SHORT on {{ticker}}")
+alertcondition(sweepLongSig, "Sweep Long",  "Liquidity sweep LONG on {{ticker}}")
+alertcondition(sweepShortSig,"Sweep Short", "Liquidity sweep SHORT on {{ticker}}")
