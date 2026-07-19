@@ -222,6 +222,18 @@ now arrives in Telegram with three buttons:
    Optional (defaults shown): `KOTAK_NEO_EXCHANGE_SEGMENT=mcx_fo`,
    `KOTAK_NEO_PRODUCT=MIS`, `KOTAK_NEO_ORDER_TYPE=MKT`.
 
+3. **The `neo_api_client` SDK is NOT installed by default.** It hard-pins
+   `requests==2.32.3`, which conflicts with this project's own `requests==2.31.0`
+   pin and breaks the Render build — so it's deliberately left out of
+   `requirements.txt`. Dry-run mode never needs it (tapping "Confirm & Place"
+   with `LIVE_TRADING=false` just shows a preview). **Only when you're ready to
+   go live with Kotak specifically**, edit `telegram-bot/requirements.txt`:
+   bump `requests==2.31.0` to `requests==2.32.3`, and add
+   `git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git@v2.0.2#egg=neo_api_client`
+   back in, then redeploy. Until then, flipping `LIVE_TRADING=true` and tapping
+   Kotak's button will just return a clear "neo_api_client is not installed"
+   error instead of a crash.
+
 ### Setup — Delta Exchange
 
 1. **Get API credentials:** Delta Exchange India → Account → **API Keys** →
@@ -246,8 +258,9 @@ now arrives in Telegram with three buttons:
    LIVE_TRADING=false                             # keep false until dry runs look right
    ```
 
-2. **Redeploy** so `requirements.txt` picks up the new `pyotp` and
-   `neo_api_client` packages (Delta only needs `requests`, already installed).
+2. **Redeploy** so `requirements.txt` picks up `pyotp` (Delta only needs
+   `requests`, already installed; Kotak's SDK is intentionally not installed
+   yet — see step 3 above).
 
 3. **Trigger a test entry alert** and tap either **Review & Place** button in
    Telegram — with `LIVE_TRADING=false` you'll land on a page reading

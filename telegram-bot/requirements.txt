@@ -2,6 +2,12 @@ flask==3.0.0
 requests==2.31.0
 gunicorn==21.2.0
 pyotp==2.9.0
-# Kotak Neo Trade API SDK — only actually contacted when LIVE_TRADING=true,
-# but the package must be installed for that code path to work.
-git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git@v2.0.2#egg=neo_api_client
+# Kotak Neo Trade API SDK (neo_api_client) is intentionally NOT installed by default:
+# it hard-pins requests==2.32.3, which conflicts with our requests==2.31.0 pin above
+# and breaks the Render build. It's also only needed once LIVE_TRADING=true for Kotak
+# Neo specifically (dry-run mode and Delta Exchange never import it). When you're
+# ready to go live with Kotak, either:
+#   (a) bump the requests pin above to ==2.32.3 and add back:
+#       git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git@v2.0.2#egg=neo_api_client
+#   (b) or install it in a separate venv/service dedicated to Kotak order placement.
+# See telegram-bot/SETUP.md PART 2 for the full walkthrough.

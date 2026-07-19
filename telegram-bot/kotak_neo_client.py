@@ -44,7 +44,16 @@ SESSION_TTL_SEC = 6 * 60 * 60  # 6 hours
 def _login():
     """Runs the Neo API's two-step login (TOTP login + MPIN validate). SDK is
     imported lazily here so dry-run mode works even without it installed."""
-    from neo_api_client import NeoAPI
+    try:
+        from neo_api_client import NeoAPI
+    except ImportError:
+        raise RuntimeError(
+            "neo_api_client is not installed (left out of requirements.txt by default — "
+            "see the comment there for why). To go live with Kotak Neo: bump the requests "
+            "pin to ==2.32.3 and add "
+            "'git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git@v2.0.2#egg=neo_api_client' "
+            "to requirements.txt, then redeploy."
+        )
 
     missing = [name for name, val in [
         ("KOTAK_NEO_CONSUMER_KEY", CONSUMER_KEY),
