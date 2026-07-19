@@ -50,7 +50,7 @@ This indicator implements an **ICT / SMC-style liquidity sweep reversal strategy
 3. Copy the entire contents of `trading-view-algo` into the editor
 4. Click **Save** → give it a name
 5. Click **Add to chart**
-6. Open the indicator settings (gear icon) and select your **Market Mode**
+6. Open the indicator settings (gear icon) — **Auto-Detect Market Mode** is ON by default, so it will pick Gold/Crypto/Crude automatically from the chart symbol. Leave it on and you never need to touch the Market Mode dropdown again when switching charts (see [Market Modes](#market-modes)).
 
 **Recommended chart timeframe:** 5m (best balance of signals and reliability).
 Alternative: 1m for scalping, 15m for slower/higher-quality setups.
@@ -107,7 +107,8 @@ Not every sweep is real. False sweeps trap you in the wrong direction. The indic
 
 | Row | Shows |
 |---|---|
-| **Mode** | Gold / Crypto / Crude (color-coded) |
+| **Symbol** | The chart's actual ticker (e.g. XAUUSD, BTCUSD, CL1!) — this is what appears in every alert/Telegram message, so gold, crypto, and crude no longer look identical |
+| **Mode** | Gold / Crypto / Crude (color-coded), plus `(auto)` if auto-detected from the symbol, `(manual)` if you turned auto-detect off, or `(fallback)` if the symbol wasn't recognized and it fell back to your manual dropdown pick |
 | **Session** | ACTIVE (green) or OFF (gray) |
 | **HTF Bias** | BULL (green) / BEAR (red) |
 | **ATR** | Current ATR value |
@@ -119,7 +120,17 @@ Not every sweep is real. False sweeps trap you in the wrong direction. The indic
 
 ## Market Modes
 
-Switch between three preset configurations via the **Market Mode** dropdown.
+Three preset configurations: Gold, Crypto, Crude Oil.
+
+### Auto-Detect (default: ON)
+With **Auto-Detect Market Mode from Chart Symbol** enabled, the indicator reads the chart's ticker and applies the right preset automatically — switch from an XAUUSD chart to a BTCUSD chart and it silently re-tunes itself, no settings menu needed. It recognizes:
+- **Gold:** tickers containing XAU, GOLD, GC1, MGC
+- **Crypto:** tickers containing BTC, ETH, SOL, XRP, DOGE, USDT, USDC, or any symbol TradingView classifies as `crypto` type
+- **Crude:** tickers containing CL1, MCL, USOIL, UKOIL, WTI, BRENT, QM1
+
+If the symbol doesn't match any pattern (e.g. an unfamiliar stock/index ticker), it falls back to the manual **Market Mode** dropdown below. Turn Auto-Detect off if you want to force a specific mode regardless of symbol (e.g. testing Crypto settings on a Gold chart).
+
+This also fixes alert text: every `alert()` now includes the actual chart symbol (e.g. `BTCUSD LONG entry @ ...`) instead of always saying "GOLD", so your Telegram messages correctly identify which instrument fired.
 
 ### 🟡 Gold Mode (default)
 - **Instruments:** XAUUSD, MCX Gold, MCX Gold Mini/Petal
@@ -138,7 +149,7 @@ Switch between three preset configurations via the **Market Mode** dropdown.
 
 ### 🔵 Crude Oil Mode
 - **Instruments:** WTI/USOIL, CL futures, MCX Crude Mini
-- **Sessions:** London (07:00–10:00 GMT), **NY Pit (14:30–16:30 GMT)**, Overlap (12:00–16:00 GMT)
+- **Sessions:** same killzones as Gold — London (07:00–10:00 GMT), NY AM (12:30–15:00 GMT), Overlap (12:00–16:00 GMT). (The old crude-only "NY Pit 14:30–16:30 GMT" window was removed — it was redundant on top of these killzones.)
 - **ATR wick threshold:** 0.6×
 - **HTF bias:** 4H EMA 50
 - **Liquidity tolerance:** 50 ticks
@@ -152,13 +163,14 @@ Switch between three preset configurations via the **Market Mode** dropdown.
 Grouped by the setting panel section.
 
 ### Market Mode
-- **Market Mode** — Gold / Crypto / Crude preset selector
+- **Auto-Detect Market Mode from Chart Symbol** — ON by default; auto-picks Gold/Crypto/Crude from the ticker on chart switch
+- **Market Mode (manual / fallback)** — Gold / Crypto / Crude preset selector; used directly if Auto-Detect is off, or as the fallback if the symbol isn't recognized
 
 ### Crypto Overrides *(only used in Crypto mode)*
 - ATR wick multiplier, liquidity tolerance, session filter, US window, HTF timeframe, pivot bars, SL buffer
 
 ### Crude Overrides *(only used in Crude mode)*
-- ATR wick multiplier, liquidity tolerance, merge zone size, session filter, NY pit session, HTF timeframe, pivot bars, SL buffer
+- ATR wick multiplier, liquidity tolerance, merge zone size, session filter (uses the same Gold killzones), HTF timeframe, pivot bars, SL buffer
 
 ### Day Levels
 - **Show Day High/Low** — toggle daily H/L lines
@@ -337,14 +349,12 @@ Two ways to route alerts to Telegram — see **`telegram-bot/SETUP.md`** for ful
 |---|---|---|---|
 | Asian | 00:00–07:00 | 05:30–12:30 | Avoid (traps common) |
 | **London** | **07:00–10:00** | **12:30–15:30** | Gold, Crude |
-| **London/NY Overlap** | **12:00–16:00** | **17:30–21:30** | Gold ⭐ prime window |
-| **NY AM (Gold)** | **12:30–15:00** | **18:00–20:30** | Gold |
-| **NY Pit (Crude)** | **14:30–16:30** | **20:00–22:00** | Crude Oil ⭐ prime window |
+| **London/NY Overlap** | **12:00–16:00** | **17:30–21:30** | Gold, Crude ⭐ prime window |
+| **NY AM** | **12:30–15:00** | **18:00–20:30** | Gold, Crude |
 | Crypto US Window | 13:00–21:00 | 18:30–02:30 | BTC/ETH |
 
 **Best evening window for Indian trader:** **5:30 PM–9:30 PM IST**
-- Gold: London/NY overlap
-- Crude: London afternoon → NY pit start
+- Gold & Crude: London/NY overlap (same killzones for both — Crude no longer has its own separate NY Pit window)
 - Crypto: US session opening
 
 ---
@@ -438,7 +448,7 @@ Two ways to route alerts to Telegram — see **`telegram-bot/SETUP.md`** for ful
 Before your first live trade:
 
 - [ ] Indicator added to chart on 5m timeframe
-- [ ] Market Mode set correctly (Gold / Crypto / Crude)
+- [ ] Auto-Detect Market Mode ON (or Market Mode set correctly if you're using it manually)
 - [ ] Session filter ON (unless trading crypto 24/7)
 - [ ] HTF Bias filter ON
 - [ ] Trade Management enabled

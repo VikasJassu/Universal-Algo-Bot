@@ -109,7 +109,7 @@ Or specific month: MCX:GOLDMOCT2026 etc.
 - (Skip if already loaded from before — same indicator works)
 
 ### 4. Verify settings
-- **Market Mode:** Gold (default)
+- **Auto-Detect Market Mode:** ON (default) — `MCX:GOLDM1!` contains "GOLD" so it auto-selects Gold mode; no manual step needed. **Market Mode (manual/fallback):** Gold (default, used if you turn auto-detect off)
 - **Session filter:** ON
 - Session Timezone: **GMT** (killzones auto-align with IST evening)
 - All other filters: default

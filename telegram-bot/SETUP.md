@@ -156,6 +156,111 @@ Done. Any alert now hits Telegram in under a second.
 
 ---
 
+## PART 2 — One-Tap Order Button (Kotak Neo + Delta Exchange + XM)
+
+Only works with **Approach B** (webhook), since it needs a public server to host
+the confirmation page. Every LONG/SHORT **entry** alert (not TP/SL hit alerts)
+now arrives in Telegram with three buttons:
+
+- **🟢 Review & Place (Kotak Neo)** — opens a confirmation page on your Render
+  server showing the signal (symbol, side, entry, SL, TP1–3), with editable
+  **quantity** and **trading symbol** fields. Tapping **Confirm & Place** there
+  calls the official Kotak Neo Trade API (MCX — gold) and submits a real market order.
+- **🟢 Review & Place (Delta Exchange)** — same confirm/place flow, but calls
+  Delta Exchange India's REST API (crypto perpetuals, plus their gold
+  futures). Independent from the Kotak button — placing on one broker does
+  **not** lock out the other for the same signal, since they're separate
+  accounts/separate money.
+- **📱 Open XM App** — just opens XM's app/trading page. XM (MT4/MT5) doesn't
+  publish a deep-link format for pre-filling an order, so you still type the
+  trade in yourself using the numbers in the alert message.
+
+### ⚠️ Safety model — read before enabling
+
+- **Defaults to DRY RUN for both brokers.** Until you set `LIVE_TRADING=true`,
+  tapping "Confirm & Place" never contacts Kotak's or Delta's servers or risks
+  real money — it just shows you what *would* have been sent. Verify a few
+  dry runs look correct first. `LIVE_TRADING` is one shared switch for both
+  brokers — there's no way to go live on one and stay dry-run on the other.
+- **No SL/TP is sent to either broker.** Only a plain entry order is placed.
+  You still manage exits manually off the SL/TP1/TP2/TP3 levels exactly as
+  before (via the alerts you already get for TP/SL hits).
+- **Confirmation links expire after 10 minutes**, and each broker's button is
+  single-use once *that* broker's placement succeeds — an old, stale-priced
+  signal can't be fired late, and a successful Kotak order won't block a
+  legitimate Delta order on the same signal (or vice versa).
+- **Keep the Render start command as `python webhook_bot.py`** (not a
+  multi-worker gunicorn setup). The pending-order state lives in memory in one
+  process; multiple workers would randomly 404 on confirm/place.
+- **Double-check the symbol field every time.** The indicator's ticker (e.g.
+  `XAUUSD`, `BTCUSD`) does not necessarily match Kotak Neo's exact contract
+  code (e.g. `GOLDM26AUGFUT`) or Delta's product symbol — crypto usually lines
+  up (`BTCUSD`), gold contracts often don't. The form pre-fills your
+  configured default but you choose what actually gets sent.
+
+### Setup — Kotak Neo
+
+1. **Get Kotak Neo API credentials:**
+   - Kotak Neo app/web → **Invest** tab → **Trade API** card → **Create Application**
+   - Copy the generated **Consumer Key** (this is your API access token)
+   - Set up **TOTP 2FA** for API login (Google/Microsoft Authenticator) — when
+     scanning the QR code, your authenticator app (or Kotak's setup screen)
+     will also show the underlying **base32 secret as text** — copy that, not
+     the 6-digit code. This is `KOTAK_NEO_TOTP_SECRET`.
+   - Note your **UCC** (client code) and **MPIN**
+
+2. **Add environment variables on Render** (Dashboard → your service → Environment):
+   ```
+   KOTAK_NEO_CONSUMER_KEY=<consumer key from step 1>
+   KOTAK_NEO_MOBILE=+91XXXXXXXXXX
+   KOTAK_NEO_UCC=<your client code>
+   KOTAK_NEO_MPIN=<your Neo app MPIN>
+   KOTAK_NEO_TOTP_SECRET=<base32 secret from step 1>
+   KOTAK_NEO_DEFAULT_SYMBOL=GOLDM26AUGFUT   # update each month when the contract rolls
+   KOTAK_NEO_DEFAULT_QTY=1
+   ```
+   Optional (defaults shown): `KOTAK_NEO_EXCHANGE_SEGMENT=mcx_fo`,
+   `KOTAK_NEO_PRODUCT=MIS`, `KOTAK_NEO_ORDER_TYPE=MKT`.
+
+### Setup — Delta Exchange
+
+1. **Get API credentials:** Delta Exchange India → Account → **API Keys** →
+   create a new key. Copy the **API Key** and **API Secret** immediately — the
+   secret is only shown once.
+2. **Add environment variables on Render:**
+   ```
+   DELTA_API_KEY=<api key>
+   DELTA_API_SECRET=<api secret>
+   DELTA_DEFAULT_SYMBOL=BTCUSD   # e.g. BTCUSD/ETHUSD for crypto; check Delta's gold contract symbol separately
+   DELTA_DEFAULT_QTY=1
+   ```
+   Optional (defaults shown): `DELTA_BASE_URL=https://api.india.delta.exchange`,
+   `DELTA_ORDER_TYPE=market_order`.
+
+### Shared setup (both brokers)
+
+1. **Add these env vars too:**
+   ```
+   PUBLIC_BASE_URL=https://tv-bot.onrender.com   # your actual Render URL
+   XM_APP_URL=https://www.xm.com/mt5             # optional override
+   LIVE_TRADING=false                             # keep false until dry runs look right
+   ```
+
+2. **Redeploy** so `requirements.txt` picks up the new `pyotp` and
+   `neo_api_client` packages (Delta only needs `requests`, already installed).
+
+3. **Trigger a test entry alert** and tap either **Review & Place** button in
+   Telegram — with `LIVE_TRADING=false` you'll land on a page reading
+   "🟢 DRY RUN", and confirming will show `[DRY RUN] Would place ...` with no
+   real order sent. Try both buttons on the same signal to confirm they don't
+   block each other.
+
+4. **Go live** only once dry runs look correct on both: set `LIVE_TRADING=true`
+   on Render and redeploy. The confirmation pages will now show a red
+   "🔴 LIVE" banner, and confirming submits a real order.
+
+---
+
 ## Testing your setup
 
 Force a test alert:
