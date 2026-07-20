@@ -249,6 +249,80 @@ now arrives in Telegram with three buttons:
    Optional (defaults shown): `DELTA_BASE_URL=https://api.india.delta.exchange`,
    `DELTA_ORDER_TYPE=market_order`.
 
+### Setup — BTC/ETH/SOL Auto-Trade (no confirm tap)
+
+Separate from the manual Delta button above: **entry alerts for BTC, ETH, or SOL skip
+the Telegram confirm step entirely** and place the order automatically the instant the
+webhook receives them. Everything else (Gold via Kotak, or any other symbol via the
+manual Delta button) is unaffected.
+
+⚠️ **Read this before enabling.** Defaults are 15% of account balance as margin **per
+symbol** (so BTC+ETH+SOL firing together can use up to 45% combined), at **200x
+leverage on BTC/ETH and 100x on SOL** (Delta's actual maximums). At 200x, Delta's
+forced liquidation triggers at roughly a **0.5% adverse price move** — inside a normal
+5-minute BTC/ETH candle range. In practice this means **the exchange's liquidation
+engine, not the indicator's own stop-loss, decides the exit on most losing trades**,
+consuming the full margin on that symbol rather than the smaller loss the strategy's SL
+was sized for. This is documented in detail at the top of the AUTO-TRADE section in
+`delta_exchange_client.py`. If you want the strategy's own SL to actually govern
+outcomes instead, lower the leverage env vars below.
+
+1. **Add environment variables on Render** (in addition to `DELTA_API_KEY`/`DELTA_API_SECRET` above):
+   ```
+   DELTA_AUTO_TRADE_CRYPTO=true    # master toggle — set false to disable entirely
+   DELTA_CAPITAL_PCT=15            # % of balance used as margin, per symbol
+   DELTA_LEVERAGE_BTC=200
+   DELTA_LEVERAGE_ETH=200
+   DELTA_LEVERAGE_SOL=100          # Delta caps SOLUSD at 100x — 200x isn't offered there
+   ```
+   Optional (defaults shown), controlling the SL/TP attached to every auto-trade:
+   ```
+   DELTA_BRACKET_TP_TIER=tp1          # which of the alert's TP1/TP2/TP3 to use as the target
+   DELTA_BRACKET_SLIPPAGE_PCT=0.3     # limit-price buffer beyond SL/TP trigger, for fill odds
+   DELTA_BRACKET_TRIGGER=last_traded_price
+   ```
+
+2. **What gets placed:** every auto-trade now attaches a stop-loss AND a take-profit to
+   the entry in the same API call — the position isn't naked anymore. Both prices come
+   straight from the alert (the Pine script already computes them). **Important:** the
+   take-profit is a single price (TP1 by default) and the position closes **100% there**
+   — this does **not** replicate the Pine script's tiered 50%/30%/20% partial-exit
+   display. If you want the bot to actually mirror that tiering (3 separate bracket
+   orders, plus moving the SL to breakeven when a TP1-hit alert later arrives), that's a
+   bigger follow-up feature — ask for it explicitly.
+
+3. **Test against Delta's TESTNET before touching the real account.** The field names
+   this code expects for wallet balance, ticker, and bracket-order responses were built
+   from Delta's docs and published Python SDK examples, but weren't confirmed against a
+   live response at build time — this is true for the SL/TP bracket fields specifically
+   (`bracket_stop_loss_price` etc.), not just the balance lookup. To validate safely:
+   - Create a **separate testnet API key** (Delta's demo account — testnet keys only
+     work against the testnet URL, and vice versa)
+   - Temporarily set `DELTA_BASE_URL=https://cdn-ind.testnet.deltaex.org` and
+     `DELTA_API_KEY`/`DELTA_API_SECRET` to the testnet key, with `LIVE_TRADING=true`
+   - Fire a real BTC alert (or hit `/webhook` manually — see the curl example earlier
+     in this doc) and check Render logs / the Telegram message for whether the computed
+     balance, size, leverage, AND the attached SL/TP prices look sane, and then check
+     Delta's testnet app directly to confirm the stop-loss and take-profit orders
+     actually appear against the open position. If the code hits an unexpected response
+     shape it raises a clear error rather than silently computing something wrong — if
+     you see "AUTO-TRADE FAILED", the field-name assumptions need adjusting before going
+     live, not just the sizing math.
+   - Only once that looks right, switch `DELTA_BASE_URL` back to production and use
+     your real API key.
+
+4. **Note on webhook timing:** the auto-trade path makes several sequential API calls
+   to Delta (balance → product info → set leverage → mark price → place order with
+   bracket) before the webhook responds to TradingView. This can take longer than a
+   simple order placement — worth watching Render's logs the first few times to confirm
+   it's completing well within TradingView's webhook timeout.
+
+5. **Still not automated:** TP1/TP2/TP3/SL-hit alerts for BTC/ETH/SOL remain
+   notification-only for anything BEYOND the single bracket SL/TP placed at entry — e.g.
+   the Pine script's SL→breakeven-at-TP1 logic doesn't get mirrored on Delta's side, and
+   TP2/TP3 (if not the chosen bracket tier) don't trigger anything. The bracket SL/TP
+   placed at entry is a static, one-time thing, not a dynamically managed position.
+
 ### Shared setup (both brokers)
 
 1. **Add these env vars too:**

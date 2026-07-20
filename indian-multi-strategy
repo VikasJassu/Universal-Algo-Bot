@@ -1,27 +1,74 @@
 //@version=6
-indicator("Indian Intraday Multi-Strategy (ORB + VWAP + EMA + Sweep)", overlay=true, max_lines_count=500, max_labels_count=500, max_bars_back=500)
+indicator("Indian Index Intraday Multi-Strategy (ORB + VWAP + EMA + Sweep, Trend-Filtered)", overlay=true, max_lines_count=500, max_labels_count=500, max_bars_back=500)
 
 // ============================================================
-// Indian intraday multi-strategy indicator
-// Combines 4 mechanical strategies with unified SL / TP1-2-3 / partial exits.
+// Indian INDEX intraday multi-strategy indicator — Nifty 50 / Bank Nifty / Sensex only.
+// (Individual large-cap stocks and MCX Crude mode have been removed from this version
+// to focus tuning specifically on index behavior. Previous version is in git history.)
+//
 // Strategies:
 //   1) ORB — Opening Range Breakout (9:15–9:30 IST default)
 //   2) VWAP + Previous Day High/Low reversal
 //   3) EMA Momentum (9/21 pullback)
 //   4) Liquidity Sweep (simplified — for full version use gold-crypto indicator)
-// Best on: Bank Nifty, Nifty 50, Sensex, top-20 large-cap stocks
+//
+// WHY THIS VERSION EXISTS: the original combined all 4 strategies with a plain OR —
+// nothing stopped VWAP mean-reversion (fade PDH/PDL) from firing SHORT while ORB/EMA
+// momentum fired LONG on the same trending day. This version adds:
+//   - An HTF trend-bias filter: every signal must agree with the day's actual direction.
+//   - A Morning Bias classifier (Bullish/Bearish/Sideways/Volatile), locked once per day
+//     from the first hour's behavior: mutes whichever strategy family tends to fail in
+//     that regime (mean-reversion on trending mornings, breakouts on quiet/sideways ones,
+//     BOTH families on violently choppy "Volatile" mornings — only Sweep stays active).
+//   - Auto-detected index tuning (Bank Nifty gets wider buffers — it moves harder per point).
+//   - Strictly intraday: every trade is tagged with the IST day it opened on, and is
+//     force-closed the instant a new IST day begins — a trade can never have its TP/SL
+//     checked against a different calendar day's price action.
+//
 // Recommended chart timeframe: 5m
 // ============================================================
 
-// ------------------------- INPUTS: MARKET MODE -------------------------
-marketMode = input.string("Stocks", "Market Mode", options=["Stocks","MCX Crude"], group="Market Mode", tooltip="Stocks = Nifty/Bank Nifty/Sensex/equity intraday (9:15-15:30 IST). MCX Crude = CRUDEOILM/CRUDEOIL with dual-session ORB (9 AM + 5 PM)")
-isMCXCrude = marketMode == "MCX Crude"
+// ------------------------- INDEX MODE -------------------------
+autoDetectIndex = input.bool(true, "Auto-Detect Index from Chart Symbol", group="Index Mode", tooltip="Reads the chart's ticker (NIFTY, BANKNIFTY, SENSEX) and auto-tunes buffers for that index. Falls back to the manual selection below if unrecognized.")
+indexMode       = input.string("Nifty 50", "Index (manual / fallback)", options=["Nifty 50", "Bank Nifty", "Sensex"], group="Index Mode")
+
+f_detectIndex() =>
+    t = syminfo.ticker
+    string m = na
+    // Check Bank Nifty / Sensex first — "NIFTY" is a substring of "BANKNIFTY", so a plain
+    // NIFTY match would misfire on Bank Nifty charts if checked in the wrong order.
+    if str.contains(t, "BANKNIFTY") or str.contains(t, "BANK NIFTY")
+        m := "Bank Nifty"
+    else if str.contains(t, "SENSEX") or str.contains(t, "BANKEX")
+        m := "Sensex"
+    else if str.contains(t, "NIFTY")
+        m := "Nifty 50"
+    m
+
+detectedIndex = autoDetectIndex ? f_detectIndex() : na
+effIndex      = not na(detectedIndex) ? detectedIndex : indexMode
+isBankNifty   = effIndex == "Bank Nifty"
+
+// Ticker used in alert text so messages always name the actual instrument
+// (previously hardcoded "INDIAN" regardless of Nifty/Bank Nifty/Sensex).
+assetTag = syminfo.ticker
 
 // ------------------------- INPUTS: STRATEGIES -------------------------
 useORB   = input.bool(true, "Enable ORB Strategy",         group="Strategies")
 useVWAP  = input.bool(true, "Enable VWAP + PDH/PDL",       group="Strategies")
 useEMA   = input.bool(true, "Enable EMA Momentum",         group="Strategies")
 useSweep = input.bool(true, "Enable Liquidity Sweep",      group="Strategies")
+
+// ------------------------- INPUTS: TREND FILTER (NEW) -------------------------
+useTrendBias = input.bool(true, "Require HTF Trend Bias (recommended)", group="Trend Filter", tooltip="Only take LONG signals when price is above the higher-timeframe EMA, and SHORT signals when below it. This is the main fix for strategies firing against each other on trending days.")
+biasTF       = input.string("15", "HTF for Bias", options=["15", "30", "60"], group="Trend Filter")
+biasEmaLen   = input.int(50, "HTF EMA Length", minval=10, group="Trend Filter")
+
+// ------------------------- INPUTS: MORNING BIAS (NEW) -------------------------
+useMorningBias   = input.bool(true, "Adapt to Morning Bias (Bullish/Bearish/Sideways/Volatile)", group="Morning Bias", tooltip="Locks a 4-way read on the day once the first hour completes: Bullish/Bearish (wide, directional first hour) -> only breakout signals in that direction stay active. Sideways (quiet first hour) -> only VWAP mean-reversion stays active. Volatile (wide but non-directional first hour — whipsaw) -> breakout AND mean-reversion both muted, only Liquidity Sweep stays active since it's a fade-the-stop-hunt strategy suited to choppy conditions.")
+dayTypeLookback  = input.int(10, "Avg Daily Range Lookback (days)", minval=3, group="Morning Bias")
+trendDayMult     = input.float(1.3, "Wide First Hour: Range > Avg Daily Range ×", minval=0.5, step=0.1, group="Morning Bias")
+chopRatioThresh  = input.float(0.35, "Directional vs Choppy: Net Move ÷ Range ≥", minval=0.05, maxval=0.95, step=0.05, group="Morning Bias", tooltip="During a wide first hour, how much of the total range must be net directional progress (vs round-tripping) to call it Bullish/Bearish rather than Volatile. Lower = more first hours get classified as directional.")
 
 // ------------------------- INPUTS: SESSION -------------------------
 sessionStr    = input.session("0915-1530", "Indian Market Session (IST)", group="Session")
@@ -53,7 +100,7 @@ tp2R          = input.float(2,   "TP2 (R multiple, fallback)", step=0.25, group=
 tp3R          = input.float(3,   "TP3 (R multiple, fallback)", step=0.25, group="Trade Management")
 tp1Pct        = input.float(50,  "TP1 Exit %", minval=0, maxval=100, group="Trade Management")
 tp2Pct        = input.float(30,  "TP2 Exit %", minval=0, maxval=100, group="Trade Management")
-tp3Pct        = input.float(20,  "TP3 Exit %", minval=0, maxval=100, group="Trade Management")
+tp3Pct        = input.float(20,  "TP3 Exit % (runner)", minval=0, maxval=100, group="Trade Management")
 
 // --- Webhook (Telegram bot integration) ---
 webhookSecret = input.string("telegram123", "Webhook Secret (matches Render env var)", group="Webhook / Telegram", tooltip="Must match WEBHOOK_SECRET env var on your Render bot. Every alert() message is auto-wrapped in JSON with this secret.")
@@ -62,34 +109,32 @@ webhookSecret = input.string("telegram123", "Webhook Secret (matches Render env 
 f_json(msg) =>
     '{"secret":"' + webhookSecret + '","text":"' + msg + '"}'
 
-// ------------------------- EFFECTIVE VALUES (mode-aware) -------------------------
-// MCX Crude uses wider tolerances, 30-min ORB, dual-session, no lunch break
-effSessionStr    = isMCXCrude ? "0900-2330" : sessionStr
-effLunchStr      = isMCXCrude ? "0000-0001" : lunchStr   // effectively disable lunch for crude
-effOrbMinutes    = isMCXCrude ? 30 : orbMinutes
-effOrbMaxRange   = isMCXCrude ? 2.0 : orbMaxRangePct
-effPdhTol        = isMCXCrude ? 0.25 : pdhTolPct
-effSlAtrBuffer   = isMCXCrude ? 0.7 : slAtrMult
-effSkipFirst15   = isMCXCrude ? false : skipFirst15
-effSkipLast15    = isMCXCrude ? false : skipLast15
+// ------------------------- EFFECTIVE VALUES (index-aware) -------------------------
+// Bank Nifty moves harder per point than Nifty/Sensex — automatically widen the
+// volatility-sensitive thresholds rather than making the user retune everything.
+effSlAtrMult      = isBankNifty ? slAtrMult + 0.2       : slAtrMult
+effSweepAtrX      = isBankNifty ? sweepAtrX + 0.1       : sweepAtrX
+effPdhTolPct      = isBankNifty ? pdhTolPct * 1.3       : pdhTolPct
+effOrbMaxRangePct = isBankNifty ? orbMaxRangePct * 1.3  : orbMaxRangePct
 
 // ------------------------- TIME / SESSION -------------------------
-inSession = not na(time(timeframe.period, effSessionStr, "Asia/Kolkata"))
-inLunch   = not na(time(timeframe.period, effLunchStr,   "Asia/Kolkata"))
+inSession = not na(time(timeframe.period, sessionStr, "Asia/Kolkata"))
+inLunch   = not na(time(timeframe.period, lunchStr,   "Asia/Kolkata"))
 
 istH = hour(time, "Asia/Kolkata")
 istM = minute(time, "Asia/Kolkata")
 
-// Skip-first / skip-last windows (stocks only — crude opens cleanly)
-nearOpen  = effSkipFirst15 and istH == 9 and istM >= 15 and istM < 30
-nearClose = effSkipLast15  and istH == 15 and istM >= 15
+nearOpen  = skipFirst15 and istH == 9  and istM >= 15 and istM < 30
+nearClose = skipLast15  and istH == 15 and istM >= 15
 tradable  = inSession and not inLunch and not nearOpen and not nearClose
 
-newDay = ta.change(time("D")) != 0
-
-// MCX Crude dual-session ORB reset (fires at start of 9 AM AND 5 PM sessions)
-mcxMorningReset = isMCXCrude and istH == 9  and istH[1] != 9
-mcxEveningReset = isMCXCrude and istH == 17 and istH[1] != 17
+// IST-anchored day key (year/month/day, e.g. 20260719) — used instead of the bare
+// ta.change(time("D")) so day-boundary detection doesn't depend on the chart's
+// timezone display setting. If that setting isn't Exchange/IST, the plain time("D")
+// change can fire off-sync with the actual 9:15 AM IST session start, letting an
+// open trade slip past cleanup into the next session before it's force-closed.
+dayKey = year(time, "Asia/Kolkata") * 10000 + month(time, "Asia/Kolkata") * 100 + dayofmonth(time, "Asia/Kolkata")
+newDay = ta.change(dayKey) != 0
 
 // ------------------------- PREVIOUS DAY HIGH / LOW -------------------------
 var float pdhVal = na
@@ -119,7 +164,6 @@ if newDay
         label.new(bar_index, pdlVal, "PDL", style=label.style_label_left, color=color.new(color.green, 20), textcolor=color.white, size=size.tiny)
 
 // ------------------------- OPENING RANGE (ORB) -------------------------
-// Bars-based tracking works for both stocks (single ORB) and crude (dual ORB).
 var float orbHigh       = na
 var float orbLow        = na
 var int   orbStartBar   = na
@@ -129,8 +173,7 @@ var bool  orbShortTaken = false
 var line  orbHiLn       = na
 var line  orbLoLn       = na
 
-// Reset ORB at session start (new day for stocks; new day OR 5 PM for crude)
-resetORB = newDay or mcxMorningReset or mcxEveningReset
+resetORB = newDay
 if resetORB
     orbHigh := na
     orbLow := na
@@ -143,8 +186,7 @@ if resetORB
     orbHiLn := na
     orbLoLn := na
 
-// Convert ORB minutes to bars based on chart timeframe
-orbDurationBars = math.max(1, int(math.ceil(effOrbMinutes * 60 / math.max(timeframe.in_seconds(), 60))))
+orbDurationBars = math.max(1, int(math.ceil(orbMinutes * 60 / math.max(timeframe.in_seconds(), 60))))
 orbBarsElapsed  = not na(orbStartBar) ? bar_index - orbStartBar : -1
 
 if useORB and not orbLocked and not na(orbStartBar) and orbBarsElapsed >= 0
@@ -155,9 +197,51 @@ if useORB and not orbLocked and not na(orbStartBar) and orbBarsElapsed >= 0
         orbLocked := true
         orbHiLn := line.new(orbStartBar, orbHigh, bar_index+1, orbHigh, extend=extend.right, color=color.yellow, width=1, style=line.style_dotted)
         orbLoLn := line.new(orbStartBar, orbLow,  bar_index+1, orbLow,  extend=extend.right, color=color.yellow, width=1, style=line.style_dotted)
-        orbLabel = isMCXCrude and istH >= 17 ? "Evening ORB" : "ORB"
-        label.new(bar_index, orbHigh, orbLabel + " High", style=label.style_label_left, color=color.new(color.yellow, 30), textcolor=color.black, size=size.tiny)
-        label.new(bar_index, orbLow,  orbLabel + " Low",  style=label.style_label_left, color=color.new(color.yellow, 30), textcolor=color.black, size=size.tiny)
+        label.new(bar_index, orbHigh, "ORB High", style=label.style_label_left, color=color.new(color.yellow, 30), textcolor=color.black, size=size.tiny)
+        label.new(bar_index, orbLow,  "ORB Low",  style=label.style_label_left, color=color.new(color.yellow, 30), textcolor=color.black, size=size.tiny)
+
+// ------------------------- MORNING BIAS: BULLISH / BEARISH / SIDEWAYS / VOLATILE (NEW) -------------------------
+// Locked once per day from the first hour's behavior. Two dimensions feed the 4-way read:
+//   1) Range: is the first hour WIDE (vs the recent average daily range) or quiet?
+//   2) Direction: within a wide first hour, did price net-travel one way, or round-trip (chop)?
+// Avg daily range excludes today (still forming) via the [1] offset inside the daily context.
+avgDailyRange  = request.security(syminfo.tickerid, "D", ta.sma(high - low, dayTypeLookback)[1], lookahead=barmerge.lookahead_off)
+dayTypeReady   = not na(avgDailyRange) and avgDailyRange > 0
+
+var float fhOpen   = na
+var float fhHigh   = na
+var float fhLow    = na
+var bool  fhLocked = false
+var string morningBias = "Building..."
+
+if resetORB
+    fhOpen := open
+    fhHigh := na
+    fhLow := na
+    fhLocked := false
+    morningBias := "Building..."
+
+fhDurationBars = math.max(1, int(math.ceil(60 * 60 / math.max(timeframe.in_seconds(), 60))))  // first 60 minutes
+fhBarsElapsed  = not na(orbStartBar) ? bar_index - orbStartBar : -1
+
+if not fhLocked and not na(orbStartBar) and fhBarsElapsed >= 0
+    if fhBarsElapsed < fhDurationBars
+        fhHigh := math.max(nz(fhHigh, high), high)
+        fhLow  := math.min(nz(fhLow, low), low)
+    if fhBarsElapsed >= fhDurationBars and not na(fhHigh) and not na(fhLow) and not na(fhOpen)
+        fhLocked := true
+        fhRange       = fhHigh - fhLow
+        fhNetMove     = close - fhOpen
+        isWideRange   = dayTypeReady and fhRange > avgDailyRange * trendDayMult
+        netMoveRatio  = fhRange > 0 ? math.abs(fhNetMove) / fhRange : 0.0
+        directional   = netMoveRatio >= chopRatioThresh
+        morningBias := not dayTypeReady ? "Building..." : not isWideRange ? "Sideways" : not directional ? "Volatile" : fhNetMove > 0 ? "Bullish" : "Bearish"
+
+// Permissive by default (including while still "Building...") — only restrict once classified.
+// Bullish/Bearish -> breakout family only. Sideways -> mean-reversion only. Volatile -> neither
+// (Liquidity Sweep, ungated here, is deliberately the only strategy left active on choppy mornings).
+allowBreakout      = (not useMorningBias) or morningBias == "Building..." or morningBias == "Bullish" or morningBias == "Bearish"
+allowMeanReversion = (not useMorningBias) or morningBias == "Building..." or morningBias == "Sideways"
 
 // ------------------------- VWAP & EMAs -------------------------
 vwapVal = ta.vwap(hlc3)
@@ -169,38 +253,49 @@ plot(useVWAP ? vwapVal : na, "VWAP",   color=color.new(color.yellow, 20), linewi
 plot(useEMA  ? emaF    : na, "9 EMA",  color=color.new(color.aqua, 30))
 plot(useEMA  ? emaS    : na, "21 EMA", color=color.new(color.orange, 30))
 
-// ------------------------- STRATEGY 1: ORB SIGNALS -------------------------
-orbRangeSize = orbLocked ? (orbHigh - orbLow) : na
-orbRangeOK   = orbLocked and (orbRangeSize / close) < (effOrbMaxRange / 100)
+// ------------------------- HTF TREND BIAS (NEW) -------------------------
+biasEma  = request.security(syminfo.tickerid, biasTF, ta.ema(close, biasEmaLen), lookahead=barmerge.lookahead_off)
+bullBias = close > biasEma
+bearBias = close < biasEma
+longBiasOK  = useTrendBias ? bullBias : true
+shortBiasOK = useTrendBias ? bearBias : true
 
-orbLongSig  = useORB and tradable and orbRangeOK and not orbLongTaken and close > orbHigh and close[1] <= orbHigh
-orbShortSig = useORB and tradable and orbRangeOK and not orbShortTaken and close < orbLow  and close[1] >= orbLow
+plot(useTrendBias ? biasEma : na, "HTF Bias EMA", color=color.new(color.fuchsia, 30), linewidth=2)
+
+// ------------------------- STRATEGY 1: ORB SIGNALS (breakout family) -------------------------
+orbRangeSize = orbLocked ? (orbHigh - orbLow) : na
+orbRangeOK   = orbLocked and (orbRangeSize / close) < (effOrbMaxRangePct / 100)
+
+orbLongSig  = useORB and tradable and allowBreakout and orbRangeOK and not orbLongTaken  and close > orbHigh and close[1] <= orbHigh and longBiasOK
+orbShortSig = useORB and tradable and allowBreakout and orbRangeOK and not orbShortTaken and close < orbLow  and close[1] >= orbLow  and shortBiasOK
 
 if orbLongSig
     orbLongTaken := true
 if orbShortSig
     orbShortTaken := true
 
-// ------------------------- STRATEGY 2: VWAP + PDH/PDL REVERSAL -------------------------
-pdhTol = not na(pdhVal) ? pdhVal * effPdhTol / 100 : 0.0
-pdlTol = not na(pdlVal) ? pdlVal * effPdhTol / 100 : 0.0
+// ------------------------- STRATEGY 2: VWAP + PDH/PDL REVERSAL (mean-reversion family) -------------------------
+pdhTol = not na(pdhVal) ? pdhVal * effPdhTolPct / 100 : 0.0
+pdlTol = not na(pdlVal) ? pdlVal * effPdhTolPct / 100 : 0.0
 
 pdlBounce  = not na(pdlVal) and low  <= pdlVal + pdlTol and close > pdlVal
 pdhReject  = not na(pdhVal) and high >= pdhVal - pdhTol and close < pdhVal
 
-vwapLongSig  = useVWAP and tradable and pdlBounce and close > vwapVal
-vwapShortSig = useVWAP and tradable and pdhReject and close < vwapVal
+vwapLongSig  = useVWAP and tradable and allowMeanReversion and pdlBounce and close > vwapVal and longBiasOK
+vwapShortSig = useVWAP and tradable and allowMeanReversion and pdhReject and close < vwapVal and shortBiasOK
 
-// ------------------------- STRATEGY 3: EMA MOMENTUM -------------------------
+// ------------------------- STRATEGY 3: EMA MOMENTUM (breakout family) -------------------------
 emaBull   = emaF > emaS and emaS > emaS[3]
 emaBear   = emaF < emaS and emaS < emaS[3]
 pullbackL = low  <= emaF and close > emaF and close > open
 pullbackS = high >= emaF and close < emaF and close < open
 
-emaLongSig  = useEMA and tradable and emaBull and pullbackL
-emaShortSig = useEMA and tradable and emaBear and pullbackS
+emaLongSig  = useEMA and tradable and allowBreakout and emaBull and pullbackL and longBiasOK
+emaShortSig = useEMA and tradable and allowBreakout and emaBear and pullbackS and shortBiasOK
 
-// ------------------------- STRATEGY 4: LIQUIDITY SWEEP -------------------------
+// ------------------------- STRATEGY 4: LIQUIDITY SWEEP (trend-aligned either regime) -------------------------
+// Not gated by day-type family: a bullish sweep already only fires when longBiasOK (i.e.
+// price is above the HTF bias), so it's inherently trend-aligned regardless of Trend/Range day.
 ph = ta.pivothigh(high, pivotLR, pivotLR)
 pl = ta.pivotlow(low,   pivotLR, pivotLR)
 var float lastPH = na
@@ -212,14 +307,14 @@ if not na(pl)
 
 upperWick = high - math.max(open, close)
 lowerWick = math.min(open, close) - low
-wickUpOK  = upperWick >= atrVal * sweepAtrX
-wickDnOK  = lowerWick >= atrVal * sweepAtrX
+wickUpOK  = upperWick >= atrVal * effSweepAtrX
+wickDnOK  = lowerWick >= atrVal * effSweepAtrX
 
 sweepBearRaw = useSweep and tradable and not na(lastPH) and high > lastPH and close < lastPH and wickUpOK
 sweepBullRaw = useSweep and tradable and not na(lastPL) and low  < lastPL and close > lastPL and wickDnOK
 
-sweepLongSig  = sweepBullRaw
-sweepShortSig = sweepBearRaw
+sweepLongSig  = sweepBullRaw and longBiasOK
+sweepShortSig = sweepBearRaw and shortBiasOK
 
 // ------------------------- COMBINED SIGNALS -------------------------
 longSig  = orbLongSig  or vwapLongSig  or emaLongSig  or sweepLongSig
@@ -241,14 +336,21 @@ var line   tp2Ln         = na
 var line   tp3Ln         = na
 var label  entryLbl      = na
 var string sName         = ""
+var int    tradeOpenDayKey = na  // IST day (dayKey) the current trade was opened on
 
 // ------------------------- END-OF-DAY / NEW-DAY TRADE CLEANUP -------------------------
-// Force-close any open trade at end of session so overnight/next-day price
-// doesn't retroactively "hit" old TP/SL levels.
-sessionEnded = not inSession and inSession[1]  // just left session (true → false transition)
-if (newDay or sessionEnded) and tradeDir != 0
-    label.new(bar_index, entryP, "EOD Force-Close (" + sName + ")", style=label.style_label_left, color=color.gray, textcolor=color.white, size=size.tiny)
-    alert(f_json("INDIAN " + sName + " force-closed at EOD @ " + str.tostring(close, "#.##")), alert.freq_once_per_bar_close)
+// Two independent triggers, either one force-closes: (1) session just ended today, or
+// (2) — the hard guarantee — the open trade's stamped opening day no longer matches
+// today's IST day key at all, however that happened. (2) is what makes this "purely
+// intraday": a trade can never have its TP/SL evaluated against a different day's price
+// action, because this check runs BEFORE the MANAGE LONG/MANAGE SHORT blocks below on
+// every single bar, not just on the specific bar where a day-change event is detected.
+sessionEnded = not inSession and inSession[1]
+staleTrade   = tradeDir != 0 and not na(tradeOpenDayKey) and tradeOpenDayKey != dayKey
+if (newDay or sessionEnded or staleTrade) and tradeDir != 0
+    closeReason = staleTrade ? "stale (previous day)" : "EOD"
+    label.new(bar_index, entryP, "Force-Close (" + sName + ", " + closeReason + ")", style=label.style_label_left, color=color.gray, textcolor=color.white, size=size.tiny)
+    alert(f_json(assetTag + " " + sName + " force-closed [" + closeReason + "] @ " + str.tostring(close, "#.##") + " — purely intraday, not carried to next session"), alert.freq_once_per_bar_close)
     line.delete(entryLn)
     line.delete(slLn)
     line.delete(tp1Ln)
@@ -264,12 +366,13 @@ if (newDay or sessionEnded) and tradeDir != 0
     tp2P := na
     tp3P := na
     sName := ""
+    tradeOpenDayKey := na
 
 // --- OPEN LONG ---
 if longSig and tradeDir == 0
     entryP := close
     slBase = orbLongSig ? orbLow : low
-    slP    := slBase - atrVal * effSlAtrBuffer
+    slP    := slBase - atrVal * effSlAtrMult
     risk   = entryP - slP
     orbTgt = orbLongSig and not na(orbRangeSize) ? entryP + orbRangeSize * orbTPmult : na
     tp1P   := entryP + risk * tp1R
@@ -286,13 +389,14 @@ if longSig and tradeDir == 0
     tp1Hit := false
     tp2Hit := false
     tradeDir := 1
-    alert(f_json("INDIAN " + sName + " LONG @ " + str.tostring(entryP, "#.##") + " | SL " + str.tostring(slP, "#.##") + " | TP1 " + str.tostring(tp1P, "#.##") + " | TP2 " + str.tostring(tp2P, "#.##") + " | TP3 " + str.tostring(tp3P, "#.##")), alert.freq_once_per_bar_close)
+    tradeOpenDayKey := dayKey
+    alert(f_json(assetTag + " " + sName + " LONG @ " + str.tostring(entryP, "#.##") + " | SL " + str.tostring(slP, "#.##") + " | TP1 " + str.tostring(tp1P, "#.##") + " | TP2 " + str.tostring(tp2P, "#.##") + " | TP3 " + str.tostring(tp3P, "#.##")), alert.freq_once_per_bar_close)
 
 // --- OPEN SHORT ---
 if shortSig and tradeDir == 0
     entryP := close
     slBase = orbShortSig ? orbHigh : high
-    slP    := slBase + atrVal * effSlAtrBuffer
+    slP    := slBase + atrVal * effSlAtrMult
     risk   = slP - entryP
     orbTgt = orbShortSig and not na(orbRangeSize) ? entryP - orbRangeSize * orbTPmult : na
     tp1P   := entryP - risk * tp1R
@@ -309,7 +413,8 @@ if shortSig and tradeDir == 0
     tp1Hit := false
     tp2Hit := false
     tradeDir := -1
-    alert(f_json("INDIAN " + sName + " SHORT @ " + str.tostring(entryP, "#.##") + " | SL " + str.tostring(slP, "#.##") + " | TP1 " + str.tostring(tp1P, "#.##") + " | TP2 " + str.tostring(tp2P, "#.##") + " | TP3 " + str.tostring(tp3P, "#.##")), alert.freq_once_per_bar_close)
+    tradeOpenDayKey := dayKey
+    alert(f_json(assetTag + " " + sName + " SHORT @ " + str.tostring(entryP, "#.##") + " | SL " + str.tostring(slP, "#.##") + " | TP1 " + str.tostring(tp1P, "#.##") + " | TP2 " + str.tostring(tp2P, "#.##") + " | TP3 " + str.tostring(tp3P, "#.##")), alert.freq_once_per_bar_close)
 
 // --- MANAGE LONG ---
 if tradeDir == 1
@@ -319,14 +424,14 @@ if tradeDir == 1
         slP := entryP
         line.set_y1(slLn, slP)
         line.set_y2(slLn, slP)
-        alert(f_json(sName + " LONG TP1 @ " + str.tostring(tp1P, "#.##") + " — exit " + str.tostring(tp1Pct, "#") + "%, SL→BE"), alert.freq_once_per_bar_close)
+        alert(f_json(assetTag + " " + sName + " LONG TP1 @ " + str.tostring(tp1P, "#.##") + " — exit " + str.tostring(tp1Pct, "#") + "%, SL→BE"), alert.freq_once_per_bar_close)
     if not tp2Hit and high >= tp2P
         tp2Hit := true
         label.new(bar_index, tp2P, "TP2 — Exit " + str.tostring(tp2Pct, "#") + "%", style=label.style_label_down, color=color.lime, textcolor=color.black, size=size.tiny)
-        alert(f_json(sName + " LONG TP2 @ " + str.tostring(tp2P, "#.##") + " — exit " + str.tostring(tp2Pct, "#") + "%"), alert.freq_once_per_bar_close)
+        alert(f_json(assetTag + " " + sName + " LONG TP2 @ " + str.tostring(tp2P, "#.##") + " — exit " + str.tostring(tp2Pct, "#") + "%"), alert.freq_once_per_bar_close)
     if high >= tp3P
         label.new(bar_index, tp3P, "TP3 — Exit " + str.tostring(tp3Pct, "#") + "%", style=label.style_label_down, color=color.lime, textcolor=color.black, size=size.small)
-        alert(f_json(sName + " LONG TP3 @ " + str.tostring(tp3P, "#.##") + " — close all"), alert.freq_once_per_bar_close)
+        alert(f_json(assetTag + " " + sName + " LONG TP3 @ " + str.tostring(tp3P, "#.##") + " — close all"), alert.freq_once_per_bar_close)
         line.delete(entryLn)
         line.delete(slLn)
         line.delete(tp1Ln)
@@ -336,7 +441,7 @@ if tradeDir == 1
         tradeDir := 0
     if tradeDir == 1 and low <= slP
         label.new(bar_index, slP, tp1Hit ? "Trail Exit" : "SL HIT", style=label.style_label_up, color=color.red, textcolor=color.white, size=size.small)
-        alert(f_json(sName + " LONG " + (tp1Hit ? "trail exit" : "SL") + " @ " + str.tostring(slP, "#.##")), alert.freq_once_per_bar_close)
+        alert(f_json(assetTag + " " + sName + " LONG " + (tp1Hit ? "trail exit" : "SL") + " @ " + str.tostring(slP, "#.##")), alert.freq_once_per_bar_close)
         line.delete(entryLn)
         line.delete(slLn)
         line.delete(tp1Ln)
@@ -353,14 +458,14 @@ if tradeDir == -1
         slP := entryP
         line.set_y1(slLn, slP)
         line.set_y2(slLn, slP)
-        alert(f_json(sName + " SHORT TP1 @ " + str.tostring(tp1P, "#.##") + " — exit " + str.tostring(tp1Pct, "#") + "%, SL→BE"), alert.freq_once_per_bar_close)
+        alert(f_json(assetTag + " " + sName + " SHORT TP1 @ " + str.tostring(tp1P, "#.##") + " — exit " + str.tostring(tp1Pct, "#") + "%, SL→BE"), alert.freq_once_per_bar_close)
     if not tp2Hit and low <= tp2P
         tp2Hit := true
         label.new(bar_index, tp2P, "TP2 — Exit " + str.tostring(tp2Pct, "#") + "%", style=label.style_label_up, color=color.lime, textcolor=color.black, size=size.tiny)
-        alert(f_json(sName + " SHORT TP2 @ " + str.tostring(tp2P, "#.##") + " — exit " + str.tostring(tp2Pct, "#") + "%"), alert.freq_once_per_bar_close)
+        alert(f_json(assetTag + " " + sName + " SHORT TP2 @ " + str.tostring(tp2P, "#.##") + " — exit " + str.tostring(tp2Pct, "#") + "%"), alert.freq_once_per_bar_close)
     if low <= tp3P
         label.new(bar_index, tp3P, "TP3 — Exit " + str.tostring(tp3Pct, "#") + "%", style=label.style_label_up, color=color.lime, textcolor=color.black, size=size.small)
-        alert(f_json(sName + " SHORT TP3 @ " + str.tostring(tp3P, "#.##") + " — close all"), alert.freq_once_per_bar_close)
+        alert(f_json(assetTag + " " + sName + " SHORT TP3 @ " + str.tostring(tp3P, "#.##") + " — close all"), alert.freq_once_per_bar_close)
         line.delete(entryLn)
         line.delete(slLn)
         line.delete(tp1Ln)
@@ -370,7 +475,7 @@ if tradeDir == -1
         tradeDir := 0
     if tradeDir == -1 and high >= slP
         label.new(bar_index, slP, tp1Hit ? "Trail Exit" : "SL HIT", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
-        alert(f_json(sName + " SHORT " + (tp1Hit ? "trail exit" : "SL") + " @ " + str.tostring(slP, "#.##")), alert.freq_once_per_bar_close)
+        alert(f_json(assetTag + " " + sName + " SHORT " + (tp1Hit ? "trail exit" : "SL") + " @ " + str.tostring(slP, "#.##")), alert.freq_once_per_bar_close)
         line.delete(entryLn)
         line.delete(slLn)
         line.delete(tp1Ln)
@@ -383,8 +488,12 @@ if tradeDir == -1
 bgcolor(inSession and inLunch ? color.new(color.red, 92) : tradable ? color.new(color.green, 95) : na)
 
 // ------------------------- STATUS TABLE -------------------------
-var table t = table.new(position.top_right, 2, 8, bgcolor=color.new(color.black, 70), border_width=1)
+var table t = table.new(position.top_right, 2, 10, bgcolor=color.new(color.black, 70), border_width=1)
 if barstate.islast
+    indexStr = effIndex + (autoDetectIndex ? (not na(detectedIndex) ? " (auto)" : " (fallback)") : " (manual)")
+    biasStr  = bullBias ? "BULL" : bearBias ? "BEAR" : "FLAT"
+    biasCol  = bullBias ? color.lime : bearBias ? color.red : color.gray
+    morningBiasCol = morningBias == "Bullish" ? color.lime : morningBias == "Bearish" ? color.red : morningBias == "Volatile" ? color.orange : morningBias == "Sideways" ? color.aqua : color.gray
     sessStr = not inSession ? "CLOSED" : inLunch ? "LUNCH" : nearOpen ? "OPEN CHOP" : nearClose ? "CLOSE CHOP" : "TRADE"
     sessCol = tradable ? color.lime : color.gray
     orbStr  = not orbLocked ? "Building..." : "Range: " + str.tostring(orbRangeSize, "#.##")
@@ -396,29 +505,33 @@ if barstate.islast
     tradeStr = tradeDir == 1 ? sName + " LONG" : tradeDir == -1 ? sName + " SHORT" : "FLAT"
     tradeCol = tradeDir == 1 ? color.lime : tradeDir == -1 ? color.red : color.gray
     progStr  = tradeDir == 0 ? "-" : tp2Hit ? "TP2 hit" : tp1Hit ? "TP1 hit" : "Open"
-    table.cell(t, 0, 0, "Mode",     text_color=color.white, text_size=size.small)
-    table.cell(t, 1, 0, marketMode, text_color=isMCXCrude ? color.orange : color.aqua, text_size=size.small)
-    table.cell(t, 0, 1, "Session",  text_color=color.white, text_size=size.small)
-    table.cell(t, 1, 1, sessStr,    text_color=sessCol,     text_size=size.small)
-    table.cell(t, 0, 2, "ORB",      text_color=color.white, text_size=size.small)
-    table.cell(t, 1, 2, orbStr,     text_color=orbCol,      text_size=size.small)
-    table.cell(t, 0, 3, "VWAP",     text_color=color.white, text_size=size.small)
-    table.cell(t, 1, 3, vwapStr,    text_color=vwapCol,     text_size=size.small)
-    table.cell(t, 0, 4, "EMA",      text_color=color.white, text_size=size.small)
-    table.cell(t, 1, 4, trendStr,   text_color=trendCol,    text_size=size.small)
-    table.cell(t, 0, 5, "ATR",      text_color=color.white, text_size=size.small)
-    table.cell(t, 1, 5, str.tostring(atrVal, "#.##"), text_color=color.white, text_size=size.small)
-    table.cell(t, 0, 6, "Trade",    text_color=color.white, text_size=size.small)
-    table.cell(t, 1, 6, tradeStr,   text_color=tradeCol,    text_size=size.small)
-    table.cell(t, 0, 7, "Progress", text_color=color.white, text_size=size.small)
-    table.cell(t, 1, 7, progStr,    text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 0, "Index",    text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 0, indexStr,   text_color=isBankNifty ? color.orange : color.yellow, text_size=size.small)
+    table.cell(t, 0, 1, "Day Bias", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 1, biasStr,    text_color=biasCol,     text_size=size.small)
+    table.cell(t, 0, 2, "Morning Bias", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 2, morningBias,    text_color=morningBiasCol, text_size=size.small)
+    table.cell(t, 0, 3, "Session",  text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 3, sessStr,    text_color=sessCol,     text_size=size.small)
+    table.cell(t, 0, 4, "ORB",      text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 4, orbStr,     text_color=orbCol,      text_size=size.small)
+    table.cell(t, 0, 5, "VWAP",     text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 5, vwapStr,    text_color=vwapCol,     text_size=size.small)
+    table.cell(t, 0, 6, "EMA",      text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 6, trendStr,   text_color=trendCol,    text_size=size.small)
+    table.cell(t, 0, 7, "ATR",      text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 7, str.tostring(atrVal, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 8, "Trade",    text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 8, tradeStr,   text_color=tradeCol,    text_size=size.small)
+    table.cell(t, 0, 9, "Progress", text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 9, progStr,    text_color=color.white, text_size=size.small)
 
 // ------------------------- ALERT CONDITIONS -------------------------
-alertcondition(orbLongSig,   "ORB Long",    "ORB Breakout LONG on {{ticker}}")
-alertcondition(orbShortSig,  "ORB Short",   "ORB Breakdown SHORT on {{ticker}}")
-alertcondition(vwapLongSig,  "VWAP Long",   "VWAP+PDL bounce LONG on {{ticker}}")
-alertcondition(vwapShortSig, "VWAP Short",  "VWAP+PDH reject SHORT on {{ticker}}")
-alertcondition(emaLongSig,   "EMA Long",    "EMA pullback LONG on {{ticker}}")
-alertcondition(emaShortSig,  "EMA Short",   "EMA pullback SHORT on {{ticker}}")
-alertcondition(sweepLongSig, "Sweep Long",  "Liquidity sweep LONG on {{ticker}}")
-alertcondition(sweepShortSig,"Sweep Short", "Liquidity sweep SHORT on {{ticker}}")
+alertcondition(orbLongSig,   "ORB Long",    "{{ticker}}: ORB Breakout LONG")
+alertcondition(orbShortSig,  "ORB Short",   "{{ticker}}: ORB Breakdown SHORT")
+alertcondition(vwapLongSig,  "VWAP Long",   "{{ticker}}: VWAP+PDL bounce LONG")
+alertcondition(vwapShortSig, "VWAP Short",  "{{ticker}}: VWAP+PDH reject SHORT")
+alertcondition(emaLongSig,   "EMA Long",    "{{ticker}}: EMA pullback LONG")
+alertcondition(emaShortSig,  "EMA Short",   "{{ticker}}: EMA pullback SHORT")
+alertcondition(sweepLongSig, "Sweep Long",  "{{ticker}}: Liquidity sweep LONG")
+alertcondition(sweepShortSig,"Sweep Short", "{{ticker}}: Liquidity sweep SHORT")

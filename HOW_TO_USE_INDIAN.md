@@ -1,6 +1,32 @@
-# How to Use — Indian Intraday Multi-Strategy Indicator
+# How to Use — Indian Index Intraday Multi-Strategy Indicator
 
-Complete guide to the Pine Script indicator combining **ORB + VWAP + EMA + Liquidity Sweep** for Indian stock market intraday trading.
+Complete guide to the Pine Script indicator combining **ORB + VWAP + EMA + Liquidity Sweep** for Indian index intraday trading.
+
+**This version is index-only** (Nifty 50 / Bank Nifty / Sensex) — individual large-cap
+stocks and MCX Crude mode have been removed to focus tuning specifically on index
+behavior. It also adds several things the original version was missing, which is why
+signals could feel unreliable on Nifty/Sensex before:
+
+- **HTF trend-bias filter** — every signal must now agree with the day's actual
+  direction (a higher-timeframe EMA gate). Previously VWAP mean-reversion could fire
+  SHORT while ORB/EMA momentum fired LONG on the same trending day — nothing stopped
+  the four strategies from fighting each other.
+- **Morning Bias classifier (Bullish / Bearish / Sideways / Volatile)** — locked once
+  per day from the first hour's behavior (range vs the recent average, and whether that
+  range was net-directional or a round-trip whipsaw). Bullish/Bearish mornings keep only
+  the breakout family (ORB/EMA) active in that direction; Sideways mornings keep only
+  VWAP mean-reversion active; **Volatile mornings (wide but non-directional first hour)
+  mute both families** — only Liquidity Sweep stays active, since fading a stop-hunt is
+  the strategy best suited to genuinely choppy conditions.
+- **Auto-detected index** — reads the chart symbol and applies Bank Nifty's wider
+  ATR/tolerance buffers automatically (it moves harder per point than Nifty/Sensex).
+- **Strictly intraday, structurally enforced** — every trade is stamped with the exact
+  IST calendar day it opened on. If a trade is still open when a new IST day begins, it
+  is force-closed immediately, before any TP/SL check can run against the new day's
+  price — a signal from today can never show as "TP hit" using tomorrow's move. This
+  also fixed a subtler bug: day-boundary detection previously depended on the chart's
+  timezone display setting rather than an explicit IST anchor, which could let a trade
+  slip past end-of-day cleanup if your chart wasn't set to Exchange/IST time.
 
 ---
 
@@ -144,6 +170,9 @@ For the **full-featured sweep detection** (with equal high/low pools, HTF bias, 
 
 | Row | Shows |
 |---|---|
+| **Index** | Nifty 50 / Bank Nifty / Sensex, plus `(auto)` if detected from the chart symbol, `(manual)` if you turned auto-detect off, or `(fallback)` if unrecognized |
+| **Day Bias** | BULL (green) / BEAR (red) / FLAT — the HTF trend-bias gate; only signals matching this direction fire |
+| **Morning Bias** | "Building…" / **Bullish** (green) / **Bearish** (red) / **Sideways** (aqua) / **Volatile** (orange) — locked after the first hour; decides which strategy family stays active for the rest of the day |
 | **Session** | TRADE (green) / LUNCH (red) / OPEN CHOP / CLOSE CHOP / CLOSED |
 | **ORB** | "Building…" or "Range: X" once locked |
 | **VWAP** | ABOVE (green) or BELOW (red) |
@@ -155,6 +184,21 @@ For the **full-featured sweep detection** (with equal high/low pools, HTF bias, 
 ---
 
 ## All Input Settings
+
+### Index Mode
+- **Auto-Detect Index from Chart Symbol** — ON by default; reads NIFTY/BANKNIFTY/SENSEX from the ticker and auto-tunes buffers
+- **Index (manual / fallback)** — Nifty 50 / Bank Nifty / Sensex; used directly if auto-detect is off, or as the fallback if the symbol isn't recognized
+
+### Trend Filter
+- **Require HTF Trend Bias** — ON by default (recommended); gates every signal to the day's actual direction
+- **HTF for Bias** — 15 / 30 / 60 minute EMA used as the bias timeframe (default 15)
+- **HTF EMA Length** — default 50
+
+### Morning Bias
+- **Adapt to Morning Bias (Bullish/Bearish/Sideways/Volatile)** — ON by default. Bullish/Bearish -> only breakout (ORB/EMA) stays active in that direction. Sideways -> only VWAP mean-reversion stays active. Volatile -> both muted, only Liquidity Sweep remains
+- **Avg Daily Range Lookback (days)** — default 10
+- **Wide First Hour: Range > Avg Daily Range ×** — default 1.3 (first hour must be 30% wider than the recent average to count as "wide")
+- **Directional vs Choppy: Net Move ÷ Range ≥** — default 0.35. Within a wide first hour, this fraction of the total range must be net directional travel (not round-tripping) to call it Bullish/Bearish rather than Volatile — lower this to classify more wide-range mornings as directional
 
 ### Strategies (toggle each on/off)
 - **Enable ORB Strategy**
@@ -196,30 +240,47 @@ For the **full-featured sweep detection** (with equal high/low pools, HTF bias, 
 
 ## Recommended Setup by Instrument
 
-### 🥇 Bank Nifty Futures (BANKNIFTY)
-- **Chart:** BANKNIFTY, 5m
-- **All 4 strategies:** ON
-- **ORB duration:** 15 min
-- **Best trades:** 9:30–10:30 AM, 1:30–3:00 PM
-- **Skip:** Wednesday (expiry)
+This version only targets Nifty 50, Bank Nifty, and Sensex — individual stocks and
+MCX Crude aren't covered here. Set **Auto-Detect Index** ON and just load the chart;
+the indicator tunes itself.
 
-### 🥈 Nifty 50 Futures (NIFTY)
+> ⚠️ **Expiry days changed in Sept 2025** (SEBI's single-weekly-expiry-per-exchange
+> reform): NSE moved its entire F&O segment to **Tuesday**, and Bank Nifty **lost its
+> weekly expiry entirely** — it's monthly-only now (last Tuesday). BSE's Sensex is the
+> weekly-expiry index there, on **Thursday**. If you're trading options around expiry
+> chop, use the table below, not the old Wednesday/Thursday assumption.
+
+| Index | Weekly expiry | Monthly expiry | Skip trading |
+|---|---|---|---|
+| **Nifty 50** | Tuesday | Last Tuesday | Tuesday (expiry chop) |
+| **Bank Nifty** | — (none since Nov 2024) | Last Tuesday | Last Tuesday of the month |
+| **Sensex** | Thursday | Last Thursday | Thursday (expiry chop) |
+
+### 🥇 Nifty 50 (NIFTY) — primary recommendation
 - **Chart:** NIFTY, 5m
-- **All 4 strategies:** ON
-- **Slower moves than Bank Nifty** — patience required
-- **Skip:** Thursday (expiry)
+- **All 4 strategies:** ON, Auto-Detect Index: ON
+- Deepest liquidity/tightest spreads of the three — best fit for this indicator's
+  tight ATR-based stops (less slippage eating into the edge on tight stops)
+- **Skip:** Tuesday expiry chop, Budget Day, RBI policy afternoons
 
-### 🥉 Large-cap Stocks (Reliance, HDFC, ICICI, TCS, Infy, SBI)
-- **Chart:** stock symbol, 5m
-- **ORB + VWAP:** ON
-- **EMA + Sweep:** OFF (individual stocks have noisier moves)
-- **Skip:** result announcement days (quarterly)
+### 🥈 Bank Nifty (BANKNIFTY)
+- **Chart:** BANKNIFTY, 5m
+- **All 4 strategies:** ON, Auto-Detect Index: ON (auto-widens ATR/tolerance buffers)
+- Bigger, sharper point moves — good once comfortable with Nifty; size down since
+  margin per lot is highest of the three
+- **Skip:** last-Tuesday-of-month expiry
+
+### 🥉 Sensex (SENSEX)
+- **Chart:** SENSEX, 5m
+- Tracks Nifty very closely (high correlation) — not real diversification, mainly
+  useful for its own Thursday weekly-expiry cycle or if your broker gives better BSE fills
+- **Skip:** Thursday expiry chop
 
 ### ❌ AVOID
-- Mid/small-cap stocks (illiquid, manipulated)
-- Individual stock options (illiquid outside top 10)
-- Penny stocks
-- New listings (< 6 months)
+- Individual stocks and MCX Crude (not covered by this version — use a dedicated
+  setup for those if needed)
+- Trading through expiry-day chop on whichever index you're on
+- Position sizes that ignore the 1% risk rule below
 
 ---
 
@@ -229,7 +290,8 @@ For the **full-featured sweep detection** (with equal high/low pools, HTF bias, 
 1. Check **SGX Nifty** overnight movement (indicates opening bias)
 2. Check **Dow Jones close** last night (US = trend leader)
 3. Check economic calendar for today (RBI meet, US data at 6 PM)
-4. Decide: **trend day** or **range day** likely
+4. Form your own rough read on the day, but let the **Morning Bias** row confirm it
+   after 10:15 AM rather than trading on the pre-market guess alone
 5. Open Bank Nifty / Nifty 5m chart with indicator loaded
 
 ### Session 1: Opening (9:15–9:30 AM)
@@ -316,6 +378,17 @@ As price moves, indicator alerts:
 - Otherwise 3R from entry
 - Full exit here — trade closed
 
+### Force-Close (strictly intraday — no exceptions)
+- Every trade is stamped with the exact IST calendar day it opened on
+- If a trade is still open when a new IST day begins (you didn't get out, or the
+  session simply ended without hitting SL/TP), it is force-closed **before** any
+  further TP/SL check can run — you'll see a gray "Force-Close" label and an alert
+  tagged `[EOD]` or `[stale (previous day)]`
+- This means a signal from today can never later show as "TP hit" using tomorrow's
+  price move — match your own broker position to this: **close everything yourself
+  by the time the market shuts, don't rely on the indicator's visual state carrying
+  meaning overnight**
+
 ---
 
 ## Learning Roadmap (Phase 1 → 3)
@@ -351,7 +424,7 @@ Settings:
 - Turn ON: All 4 strategies
 - Trade any window inside the green background
 - Trades: 2–3 per day maximum
-- Add more instruments (Nifty 50, top-3 large-caps)
+- Add the second index (e.g. started on Bank Nifty → add Nifty 50, or vice versa)
 
 ---
 
@@ -364,9 +437,9 @@ Settings:
 4. **Expiration:** Open-ended
 5. Save
 
-You'll get alerts like:
+You'll get alerts like (using the chart's actual symbol, not a generic "INDIAN" label):
 ```
-INDIAN ORB LONG @ 52340 | SL 52230 | TP1 52410 | TP2 52510 | TP3 52620
+NIFTY ORB LONG @ 24580 | SL 24540 | TP1 24660 | TP2 24720 | TP3 24800
 ```
 
 ### Send to Telegram
@@ -457,8 +530,9 @@ Do not trade on:
 
 | Event | Frequency | Why |
 |---|---|---|
-| **Bank Nifty Expiry (Wed)** | Weekly | Chaos in Bank Nifty |
-| **Nifty Expiry (Thu)** | Weekly | Chaos in Nifty |
+| **Bank Nifty Expiry (last Tue of month)** | Monthly | Chaos in Bank Nifty (weekly expiry was discontinued Nov 2024) |
+| **Nifty Expiry (Tue)** | Weekly | Chaos in Nifty |
+| **Sensex Expiry (Thu)** | Weekly | Chaos in Sensex |
 | **Budget Day (Feb 1)** | Yearly | Wild moves all day |
 | **RBI Policy** | Bi-monthly | 2:30 PM violent moves |
 | **Result Days** | Quarterly (per stock) | Individual stock chaos |
@@ -526,7 +600,7 @@ Before your first live trade:
 | Path | Purpose |
 |---|---|
 | `trading-view-algo` | Gold / Crypto / Crude indicator (multi-asset ICT sweeps) |
-| `indian-multi-strategy` | This indicator — Indian intraday ORB/VWAP/EMA/Sweep |
+| `indian-multi-strategy` | This indicator — Nifty/Bank Nifty/Sensex ORB/VWAP/EMA/Sweep, trend-bias + day-type filtered |
 | `HOW_TO_USE.md` | Guide for gold/crypto/crude indicator |
 | `HOW_TO_USE_INDIAN.md` | This guide |
 | `telegram-bot/*` | Telegram alert forwarder (works with both indicators) |

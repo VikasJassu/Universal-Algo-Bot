@@ -3,17 +3,26 @@ TradingView Webhook → Telegram Bot
 Receives POST requests from TradingView alerts and forwards to Telegram.
 Requires TradingView Essential plan (webhook alerts).
 
-Entry signals (LONG/SHORT entry alerts) additionally get three inline buttons:
-  - "Review & Place (Kotak Neo)" -> opens a confirmation page on this same
-    server; tapping "Confirm & Place" there calls the Kotak Neo Trade API
-    (see kotak_neo_client.py). Defaults to DRY-RUN (no real order) until
-    LIVE_TRADING=true is set.
-  - "Review & Place (Delta Exchange)" -> same confirm/place flow, but calls
-    Delta Exchange India's REST API (see delta_exchange_client.py). Also
-    dry-run by default, gated by the same LIVE_TRADING switch.
-  - "Open XM App" -> best-effort link to XM's app/web trading page. XM/MT5
-    don't publish a deep-link format for pre-filling an order, so this only
-    opens the app — you still enter the trade manually from the message text.
+Entry signals (LONG/SHORT entry alerts) are handled one of two ways:
+
+  - **BTC / ETH / SOL** -> fully automatic, no confirm tap. The instant the alert
+    arrives, delta_exchange_client.auto_place_order() sizes the position at 15% of
+    account balance as margin (independently per symbol) at a preset leverage
+    (200x BTC/ETH, 100x SOL — Delta's own max), and places the order immediately.
+    Telegram gets a notification AFTER the fact reporting what happened — it's not
+    a gate. Still dry-run by default until LIVE_TRADING=true. See the AUTO-TRADE
+    section in delta_exchange_client.py for the full risk tradeoffs of this
+    leverage/sizing combo (deliberately confirmed, not an oversight).
+  - **Everything else** (Gold/MCX via Kotak Neo, or manual Delta/XM) -> the
+    original three-button flow:
+      - "Review & Place (Kotak Neo)" -> opens a confirmation page on this same
+        server; tapping "Confirm & Place" calls the Kotak Neo Trade API
+        (see kotak_neo_client.py). Dry-run by default until LIVE_TRADING=true.
+      - "Review & Place (Delta Exchange)" -> same confirm/place flow via Delta's
+        REST API, for any symbol not covered by the BTC/ETH/SOL auto-trade path.
+      - "Open XM App" -> best-effort link to XM's app/web trading page. XM/MT5
+        don't publish a deep-link format for pre-filling an order, so this only
+        opens the app — you still enter the trade manually from the message text.
 """
 import html
 import json
@@ -202,7 +211,11 @@ def format_message(raw: str) -> str:
         emoji = "🟡 *TRAIL EXIT*"
     else:
         emoji = "📊 *Alert*"
-    return f"{emoji}\n\n`{raw}`"
+    # Triple backticks (code block), not single (inline code span) — the auto-trade
+    # summary appended for BTC/ETH/SOL entries is multi-line, and Telegram's legacy
+    # Markdown parser isn't reliable with a newline inside single-backtick inline code
+    # (send would silently fail with a 400 "can't parse entities" in that case).
+    return f"{emoji}\n\n```\n{raw}\n```"
 
 
 # ------------------------- Confirmation page rendering -------------------------
@@ -298,13 +311,39 @@ def webhook():
         return jsonify({"error": "empty message"}), 400
 
     reply_markup = None
+    display_text = clean_text
     parsed = parse_entry_signal(clean_text)
     if parsed:
-        token = create_pending_order(parsed)
-        base_url = PUBLIC_BASE_URL or request.url_root
-        reply_markup = build_keyboard(token, base_url)
+        auto_symbol = delta_exchange_client.match_auto_symbol(parsed["symbol"])
+        if auto_symbol and delta_exchange_client.AUTO_TRADE_ENABLED:
+            # BTC/ETH/SOL: no confirm button — fire the order now, report the outcome after.
+            side = "BUY" if parsed["side"] == "LONG" else "SELL"
+            # SL/TP come straight from the alert (already computed by the Pine script).
+            # TP tier is configurable (DELTA_BRACKET_TP_TIER, default tp1) — whichever
+            # price is used, the position exits 100% there, not the strategy's tiered
+            # 50/30/20 split (see auto_place_order()'s docstring for why).
+            try:
+                sl_price = float(parsed["sl"])
+            except (KeyError, TypeError, ValueError):
+                sl_price = None
+            try:
+                tp_price = float(parsed.get(delta_exchange_client.BRACKET_TP_TIER, parsed.get("tp1")))
+            except (TypeError, ValueError):
+                tp_price = None
+            auto_result = delta_exchange_client.auto_place_order(auto_symbol, side, sl=sl_price, tp=tp_price)
+            if auto_result["dry_run"]:
+                tag = "🤖 DRY RUN (auto-trade)"
+            elif auto_result["ok"]:
+                tag = "🤖 AUTO-EXECUTED"
+            else:
+                tag = "🤖 AUTO-TRADE FAILED"
+            display_text = f"{clean_text}\n\n{tag}: {auto_result['summary']}"
+        else:
+            token = create_pending_order(parsed)
+            base_url = PUBLIC_BASE_URL or request.url_root
+            reply_markup = build_keyboard(token, base_url)
 
-    result = send_telegram(format_message(clean_text), reply_markup)
+    result = send_telegram(format_message(display_text), reply_markup)
     return jsonify({"ok": result.get("ok", False), "telegram": result}), 200
 
 
@@ -375,6 +414,11 @@ def debug():
         "public_base_url_set": bool(PUBLIC_BASE_URL),
         "kotak_neo_live_trading": kotak_neo_client.LIVE_TRADING,
         "delta_exchange_live_trading": delta_exchange_client.LIVE_TRADING,
+        "delta_auto_trade_crypto_enabled": delta_exchange_client.AUTO_TRADE_ENABLED,
+        "delta_auto_trade_capital_pct": delta_exchange_client.CAPITAL_PCT,
+        "delta_auto_trade_leverage": delta_exchange_client.DEFAULT_LEVERAGE,
+        "delta_api_key_set": bool(delta_exchange_client.API_KEY) and bool(delta_exchange_client.API_SECRET),
+        "delta_base_url": delta_exchange_client.BASE_URL,
         "pending_orders_in_memory": len(PENDING_ORDERS),
     })
 
