@@ -26,12 +26,15 @@ Auto-trade (BTC/ETH/SOL only, no manual confirm — see the AUTO-TRADE section b
                              trigger, to improve fill probability during fast moves)
   DELTA_BRACKET_TRIGGER    (default "last_traded_price" — the only value confirmed in
                              Delta's docs; "mark_price" may also work but is unverified)
-  DELTA_ENTRY_SLIPPAGE_PCT (default "1.0" — the entry itself is a "limit_order" priced
-                             this far through the mark price, not a true market order;
-                             see auto_place_order()'s comment for why: bracket fields
-                             are only confirmed by Delta's docs on limit entries, and a
-                             market_order entry was observed to drop the SL/TP legs
-                             silently on testnet)
+
+Note on architecture: the entry order (plain market_order) and the SL/TP bracket are
+placed as TWO SEPARATE API calls — place_order() for the entry, then place_bracket()
+via Delta's dedicated /v2/orders/bracket endpoint once the position exists. This
+replaced an earlier single-call approach (bracket_* fields attached directly to the
+entry) after it silently dropped the SL/TP legs twice on testnet, with both
+market_order and limit_order entries. Every bracketed auto-trade is followed by
+verify_bracket_orders(), an independent GET check that the SL/TP orders actually
+exist — this doesn't trust either call's own success flag.
 """
 import hashlib
 import hmac
@@ -92,22 +95,19 @@ def place_order(symbol: str, side: str, quantity: int, order_type: str = None,
     symbol: Delta's product_symbol (e.g. "BTCUSD" for the perpetual — crypto
             symbols line up with the indicator's ticker; gold contracts don't
             necessarily, so double-check before confirming).
-    limit_price: required alongside order_type="limit_order". Delta's docs only ever
-    show bracket_* fields paired with a limit entry, never market_order — confirmed by
-    a real testnet failure where a market_order entry succeeded but the SL/TP legs
-    silently never attached. auto_place_order() now always sends order_type="limit_order"
-    with an aggressively marketable price (i.e. priced to fill almost immediately, like
-    a market order in practice) specifically so the bracket fields are honored.
-    stop_loss_price / take_profit_price: optional absolute prices. When given, they're
-    attached as a bracket order in the SAME API call as the entry — i.e. the stop-loss
-    and take-profit orders exist on Delta's side from the moment the position opens,
-    not added afterward. Omit either to skip that leg (naked entry, prior behavior).
-
-    ⚠️ Even with the limit_order fix, this is NOT fully trusted blind — auto_place_order()
-    separately calls verify_bracket_orders() after this returns to actually confirm the
-    SL/TP orders exist via a follow-up GET, specifically because "the entry succeeded but
-    the bracket silently didn't attach" already happened once and a naked leveraged
-    position going unnoticed is the worst-case outcome here.
+    limit_price: only used when order_type="limit_order" — otherwise ignored. Not used
+    by auto_place_order() as of the current design (see below); kept available for
+    manual/future use.
+    stop_loss_price / take_profit_price: optional absolute prices, attached as flat
+    bracket_* fields on THIS SAME call. ⚠️ auto_place_order() no longer uses this
+    parameter pair — attaching bracket fields directly to the entry order was tried
+    twice (once with order_type="market_order", once with "limit_order") and BOTH
+    times the entry succeeded while the SL/TP legs silently never attached. It now
+    places a plain entry here, then calls place_bracket() as a SEPARATE follow-up call
+    via Delta's dedicated bracket endpoint. These parameters are kept on place_order()
+    for the (currently unused) case of wanting bracket-on-entry again — if you use them,
+    verify independently that the resulting orders actually exist, the same way
+    auto_place_order() does via verify_bracket_orders().
 
     Returns: {"ok": bool, "dry_run": bool, "raw": <api response or None>,
               "error": <str or None>, "summary": <human-readable str>}
@@ -293,6 +293,46 @@ def get_mark_price(delta_symbol: str) -> float:
     return float(price)
 
 
+def place_bracket(product_id, delta_side: str, stop_loss_price: float = None,
+                   take_profit_price: float = None) -> dict:
+    """Attaches a stop-loss and/or take-profit to an EXISTING position via Delta's
+    dedicated bracket endpoint (POST /v2/orders/bracket) — as a SEPARATE call after
+    the entry, not attached to the entry order itself.
+
+    This replaces the earlier approach of sending bracket_* fields flat on the /v2/orders
+    entry call. That was tried twice (first with order_type="market_order", then with
+    "limit_order" after Delta's docs suggested brackets are only confirmed on limit
+    entries) and BOTH times the entry succeeded while the SL/TP legs silently never
+    attached. Rather than guess a third parameter tweak on the same combined-call
+    mechanism, this uses the endpoint Delta's docs describe specifically for attaching
+    a bracket to a position — a genuinely different code path, not a variation of the
+    same one. If this also fails, the raw Delta response is captured (see
+    auto_place_order()) so the exact rejection reason is visible instead of guessed at.
+    """
+    sl_slippage_pct = float(os.environ.get("DELTA_BRACKET_SLIPPAGE_PCT", "0.3"))
+    trigger_method = os.environ.get("DELTA_BRACKET_TRIGGER", "last_traded_price")
+
+    body_obj = {"product_id": product_id, "bracket_stop_trigger_method": trigger_method}
+
+    if stop_loss_price is not None:
+        sl_limit = _closing_limit_price(stop_loss_price, delta_side, sl_slippage_pct)
+        body_obj["stop_loss_order"] = {
+            "order_type": "limit_order",
+            "stop_price": str(stop_loss_price),
+            "limit_price": str(round(sl_limit, 2)),
+        }
+
+    if take_profit_price is not None:
+        tp_limit = _closing_limit_price(take_profit_price, delta_side, sl_slippage_pct)
+        body_obj["take_profit_order"] = {
+            "order_type": "limit_order",
+            "stop_price": str(take_profit_price),
+            "limit_price": str(round(tp_limit, 2)),
+        }
+
+    return _post("/v2/orders/bracket", body_obj)
+
+
 def verify_bracket_orders(product_id, expect_sl: bool, expect_tp: bool) -> dict:
     """Queries Delta's open orders for this product right after placing a bracketed
     entry, to actually CONFIRM the stop-loss/take-profit orders exist rather than
@@ -332,17 +372,22 @@ def auto_place_order(delta_symbol: str, side: str, sl: float = None, tp: float =
 
     side: "BUY" or "SELL"
     sl: stop-loss price from the alert (structure ± ATR buffer, as computed by the
-        Pine script). Attached as a bracket order in the same API call as the entry.
+        Pine script). Placed via place_bracket() as a SEPARATE call right after the
+        entry order confirms — NOT attached to the entry call itself (that approach
+        was tried twice, with both market_order and limit_order entries, and both
+        times the entry succeeded while the SL/TP legs silently never attached).
     tp: take-profit price. Defaults to the alert's TP1 unless DELTA_BRACKET_TP_TIER
         overrides which tier to use (tp1/tp2/tp3 — passed in by the caller already
-        resolved, this function just attaches whatever price it's given).
+        resolved, this function just attaches whatever price it's given). Since it's
+        sized for the FULL position, hitting it closes the entire trade — this directly
+        satisfies "close on TP1" once the bracket actually attaches (verified below).
 
-    ⚠️ This attaches ONE stop-loss and ONE take-profit to the FULL position size —
-    it does NOT replicate the Pine script's tiered 50%/30%/20% partial exits (TP1/TP2/
+    ⚠️ This places ONE stop-loss and ONE take-profit for the FULL position size — it
+    does NOT replicate the Pine script's tiered 50%/30%/20% partial exits (TP1/TP2/
     TP3). The position closes 100% at whichever single TP price is passed in. Splitting
-    into three bracket orders (one per tier) with a shared SL, plus dynamically moving
-    that SL to breakeven when a TP1-hit alert later arrives, is a separate, materially
-    bigger feature — ask for it explicitly if you want true tiered-exit parity.
+    into three separate brackets (one per tier) with a shared SL, plus dynamically
+    moving that SL to breakeven when a TP1-hit alert later arrives, is a separate,
+    materially bigger feature — ask for it explicitly if you want true tiered parity.
 
     Returns the same shape as place_order(): {"ok","dry_run","raw","error","summary"}.
     """
@@ -386,34 +431,44 @@ def auto_place_order(delta_symbol: str, side: str, sl: float = None, tp: float =
                    f"price=${mark_price}, contract_value={contract_value}) — trade skipped.")
             return {"ok": False, "dry_run": False, "raw": None, "error": err, "summary": err}
 
-        # Bracket fields (SL/TP) are only ever shown in Delta's docs paired with a
-        # limit_order entry, never market_order — and a market_order entry with brackets
-        # attached was observed to succeed while silently dropping the SL/TP legs. So:
-        # use an aggressively marketable limit price instead of a true market order,
-        # specifically to get the bracket fields honored while still filling immediately.
-        entry_slippage_pct = float(os.environ.get("DELTA_ENTRY_SLIPPAGE_PCT", "1.0"))
-        entry_buffer = mark_price * (entry_slippage_pct / 100)
-        marketable_limit = mark_price + entry_buffer if side.upper() == "BUY" else mark_price - entry_buffer
-
-        result = place_order(symbol=delta_symbol, side=side, quantity=contracts,
-                              order_type="limit_order", limit_price=round(marketable_limit, 2),
-                              stop_loss_price=sl, take_profit_price=tp)
-        prefix = (f"AUTO {side.upper()} {contracts} x {delta_symbol} @ ~${mark_price:.2f} "
-                  f"(limit {marketable_limit:.2f}) | margin ${margin:.2f} "
-                  f"({CAPITAL_PCT:.0f}% of ${balance:.2f} balance) "
+        # STEP 1: plain entry, no bracket fields attached to it. This part has reliably
+        # worked in every test so far (both prior failures were specifically the bracket
+        # legs going missing, never the entry itself) — a normal market order.
+        result = place_order(symbol=delta_symbol, side=side, quantity=contracts, order_type="market_order")
+        prefix = (f"AUTO {side.upper()} {contracts} x {delta_symbol} @ ~${mark_price:.2f} | "
+                  f"margin ${margin:.2f} ({CAPITAL_PCT:.0f}% of ${balance:.2f} balance) "
                   f"@ {leverage}x = ${notional:.2f} notional{bracket_desc}. ")
         result["summary"] = prefix + result.get("summary", "")
 
-        # Don't trust the entry's success=true for the bracket legs — confirm they
-        # actually exist. This is the safety net for exactly what already happened once:
-        # entry succeeds, SL/TP silently don't attach, and nobody finds out until it's
-        # too late on a naked 200x position.
-        if result["ok"] and (sl is not None or tp is not None):
+        if not result["ok"]:
+            return result  # entry itself failed — nothing to attach a bracket to
+
+        # STEP 2: attach SL/TP as a SEPARATE call via the dedicated bracket endpoint,
+        # now that the position actually exists. See place_bracket()'s docstring for
+        # why this replaced the earlier "attach bracket fields to the entry" approach.
+        if sl is not None or tp is not None:
+            delta_side = "buy" if side.upper() == "BUY" else "sell"
+            bracket_error = None
+            try:
+                bracket_resp = place_bracket(product_id, delta_side, stop_loss_price=sl, take_profit_price=tp)
+                if not (isinstance(bracket_resp, dict) and bracket_resp.get("success")):
+                    bracket_error = f"bracket call rejected: {bracket_resp}"
+            except Exception as e:
+                bracket_error = f"bracket call failed: {e}"
+
+            # Don't trust either the bracket call's own success flag OR its absence of an
+            # exception — confirm the SL/TP orders actually exist. This is the permanent
+            # safety net for exactly what happened twice already: something reports fine
+            # while the protection silently isn't there.
             check = verify_bracket_orders(product_id, expect_sl=sl is not None, expect_tp=tp is not None)
-            if not check["verified"]:
-                missing = check.get("missing") or [check.get("reason", "unknown")]
+            if not check["verified"] or bracket_error:
+                reasons = list(check.get("missing") or [])
+                if check.get("reason"):
+                    reasons.append(check["reason"])
+                if bracket_error:
+                    reasons.append(bracket_error)
                 result["summary"] = (
-                    f"⚠️⚠️ POSITION OPEN WITHOUT FULL PROTECTION — MISSING: {', '.join(missing)} — "
+                    f"⚠️⚠️ POSITION OPEN WITHOUT FULL PROTECTION — {'; '.join(reasons)} — "
                     f"CHECK DELTA AND ADD MANUALLY NOW ⚠️⚠️\n" + result["summary"]
                 )
                 result["bracket_verified"] = False

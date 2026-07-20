@@ -282,14 +282,17 @@ outcomes instead, lower the leverage env vars below.
    DELTA_BRACKET_TRIGGER=last_traded_price
    ```
 
-2. **What gets placed:** every auto-trade now attaches a stop-loss AND a take-profit to
-   the entry in the same API call — the position isn't naked anymore. Both prices come
-   straight from the alert (the Pine script already computes them). **Important:** the
-   take-profit is a single price (TP1 by default) and the position closes **100% there**
-   — this does **not** replicate the Pine script's tiered 50%/30%/20% partial-exit
-   display. If you want the bot to actually mirror that tiering (3 separate bracket
-   orders, plus moving the SL to breakeven when a TP1-hit alert later arrives), that's a
-   bigger follow-up feature — ask for it explicitly.
+2. **What gets placed:** every auto-trade places a plain entry, then separately attaches
+   a stop-loss AND a take-profit via Delta's bracket endpoint — the position isn't naked
+   anymore. Both prices come straight from the alert (the Pine script already computes
+   them). The take-profit is sized for the FULL position, so **hitting it closes the
+   entire trade automatically** — no separate "close on TP1" logic needed, this is just
+   what a full-size take-profit order does when it fills. **Important:** the take-profit
+   is a single price (TP1 by default, `DELTA_BRACKET_TP_TIER`) — this does **not**
+   replicate the Pine script's tiered 50%/30%/20% partial-exit display. If you want the
+   bot to actually mirror that tiering (3 separate bracket orders, plus moving the SL to
+   breakeven when a TP1-hit alert later arrives), that's a bigger follow-up feature —
+   ask for it explicitly.
 
 3. **Test against Delta's TESTNET before touching the real account.** The field names
    this code expects for wallet balance, ticker, and bracket-order responses were built
@@ -321,19 +324,25 @@ outcomes instead, lower the leverage env vars below.
      confusing `insufficient_margin` rejection — if you still see the old confusing
      version, something about leverage confirmation is failing again and the raw
      Delta response in the error is the place to start.
-   - **Second known failure mode, also already fixed once:** the entry order reports
-     success but no stop-loss/take-profit actually shows up on Delta. Root cause: Delta's
-     docs only ever pair the `bracket_*` fields with `order_type: "limit_order"`, never
-     `market_order` — a market entry with brackets attached was observed to succeed
-     while silently dropping the SL/TP legs. Fixed by switching the entry to an
-     aggressively marketable `limit_order` (see `DELTA_ENTRY_SLIPPAGE_PCT`, default 1.0%
-     through the mark price — fills essentially immediately in practice). As a permanent
-     safety net on top of that fix, every bracketed auto-trade now does a follow-up
-     `GET /v2/orders` check to actually confirm the SL/TP orders exist — if they don't,
-     the Telegram message leads with `⚠️⚠️ POSITION OPEN WITHOUT FULL PROTECTION ⚠️⚠️`
-     instead of silently reporting a clean success. If you ever see that warning, go
-     add the stop manually on Delta immediately, then let me know so we can dig into
-     why verification failed that specific time.
+   - **Second known failure mode, fixed twice (architecture change on the second pass):**
+     the entry order reports success but no stop-loss/take-profit actually shows up on
+     Delta. First attempted fix: switch the entry to `order_type: "limit_order"` (Delta's
+     docs only ever pair `bracket_*` fields with limit entries in examples, never
+     `market_order`) — this did NOT resolve it; the SL/TP legs still silently failed to
+     attach even as a limit entry. Second fix, current behavior: stop attaching bracket
+     fields to the entry order at all. The entry is now a plain `market_order` (this part
+     has reliably worked in every test), and SL/TP are placed as a SEPARATE follow-up
+     call to Delta's dedicated `POST /v2/orders/bracket` endpoint once the position
+     exists — a genuinely different code path, not a parameter variation of the same
+     combined-call mechanism that failed twice. As a permanent safety net regardless of
+     which approach is in use, every bracketed auto-trade does a follow-up `GET /v2/orders`
+     check to actually confirm the SL/TP orders exist — if they don't, or if the bracket
+     call itself was rejected, the Telegram message leads with
+     `⚠️⚠️ POSITION OPEN WITHOUT FULL PROTECTION ⚠️⚠️` and includes Delta's exact
+     rejection reason, instead of silently reporting a clean success. If you ever see
+     that warning, go add the stop manually on Delta immediately, then send me the exact
+     summary text — the specific error is what tells us the next thing to fix, rather
+     than guessing again.
 
 4. **Note on webhook timing:** the auto-trade path makes several sequential API calls
    to Delta (balance → product info → set leverage → mark price → place order with
