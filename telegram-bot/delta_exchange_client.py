@@ -26,6 +26,12 @@ Auto-trade (BTC/ETH/SOL only, no manual confirm — see the AUTO-TRADE section b
                              trigger, to improve fill probability during fast moves)
   DELTA_BRACKET_TRIGGER    (default "last_traded_price" — the only value confirmed in
                              Delta's docs; "mark_price" may also work but is unverified)
+  DELTA_ENTRY_SLIPPAGE_PCT (default "1.0" — the entry itself is a "limit_order" priced
+                             this far through the mark price, not a true market order;
+                             see auto_place_order()'s comment for why: bracket fields
+                             are only confirmed by Delta's docs on limit entries, and a
+                             market_order entry was observed to drop the SL/TP legs
+                             silently on testnet)
 """
 import hashlib
 import hmac
@@ -78,6 +84,7 @@ def _closing_limit_price(trigger_price: float, delta_side: str, buffer_pct: floa
 
 
 def place_order(symbol: str, side: str, quantity: int, order_type: str = None,
+                 limit_price: float = None,
                  stop_loss_price: float = None, take_profit_price: float = None) -> dict:
     """
     side: "BUY" or "SELL" — map LONG->BUY, SHORT->SELL before calling this.
@@ -85,20 +92,22 @@ def place_order(symbol: str, side: str, quantity: int, order_type: str = None,
     symbol: Delta's product_symbol (e.g. "BTCUSD" for the perpetual — crypto
             symbols line up with the indicator's ticker; gold contracts don't
             necessarily, so double-check before confirming).
+    limit_price: required alongside order_type="limit_order". Delta's docs only ever
+    show bracket_* fields paired with a limit entry, never market_order — confirmed by
+    a real testnet failure where a market_order entry succeeded but the SL/TP legs
+    silently never attached. auto_place_order() now always sends order_type="limit_order"
+    with an aggressively marketable price (i.e. priced to fill almost immediately, like
+    a market order in practice) specifically so the bracket fields are honored.
     stop_loss_price / take_profit_price: optional absolute prices. When given, they're
     attached as a bracket order in the SAME API call as the entry — i.e. the stop-loss
     and take-profit orders exist on Delta's side from the moment the position opens,
     not added afterward. Omit either to skip that leg (naked entry, prior behavior).
 
-    ⚠️ UNVERIFIED AGAINST A LIVE RESPONSE — see the AUTO-TRADE section's testnet note.
-    The bracket_* field names and required/optional-ness come from Delta's docs and
-    example payloads; the docs page didn't clearly confirm whether the *_limit_price
-    fields are mandatory or what happens if a bracket order is rejected outright (e.g.
-    if bracket params aren't accepted on a market_order entry). If Delta rejects the
-    whole order because of the bracket fields, this fails loudly via the normal
-    ok=False/error path below — it will NOT silently fall back to a naked entry, so
-    you'd see "AUTO-TRADE FAILED" in Telegram rather than an unprotected position you
-    don't know about. Confirm on testnet before trusting this on the real account.
+    ⚠️ Even with the limit_order fix, this is NOT fully trusted blind — auto_place_order()
+    separately calls verify_bracket_orders() after this returns to actually confirm the
+    SL/TP orders exist via a follow-up GET, specifically because "the entry succeeded but
+    the bracket silently didn't attach" already happened once and a naked leveraged
+    position going unnoticed is the worst-case outcome here.
 
     Returns: {"ok": bool, "dry_run": bool, "raw": <api response or None>,
               "error": <str or None>, "summary": <human-readable str>}
@@ -130,6 +139,9 @@ def place_order(symbol: str, side: str, quantity: int, order_type: str = None,
         "side": delta_side,
         "order_type": order_type,
     }
+
+    if order_type == "limit_order" and limit_price is not None:
+        body_obj["limit_price"] = str(limit_price)
 
     if stop_loss_price is not None:
         sl_limit = _closing_limit_price(stop_loss_price, delta_side, sl_slippage_pct)
@@ -259,7 +271,17 @@ def get_product_info(delta_symbol: str) -> dict:
 
 
 def set_leverage(product_id, leverage: int) -> dict:
-    return _post(f"/v2/products/{product_id}/orders/leverage", {"leverage": leverage})
+    """Raises if Delta doesn't confirm the leverage change — previously this response
+    was discarded, so a failed/ignored leverage change went unnoticed and the margin
+    math below proceeded as if the requested leverage had actually been applied. That
+    produced exactly this failure mode: sized for 200x, but Delta's own margin
+    requirement reflected whatever leverage was ACTUALLY in effect (which the
+    "insufficient_margin" error's numbers suggest was closer to 5x), so the order was
+    undersized for the leverage Delta really used and got rejected."""
+    resp = _post(f"/v2/products/{product_id}/orders/leverage", {"leverage": leverage})
+    if not (isinstance(resp, dict) and resp.get("success")):
+        raise RuntimeError(f"Delta did not confirm {leverage}x leverage on product {product_id}: {resp}")
+    return resp
 
 
 def get_mark_price(delta_symbol: str) -> float:
@@ -269,6 +291,39 @@ def get_mark_price(delta_symbol: str) -> float:
     if price is None:
         raise RuntimeError(f"Unexpected ticker response for {delta_symbol}: {data}")
     return float(price)
+
+
+def verify_bracket_orders(product_id, expect_sl: bool, expect_tp: bool) -> dict:
+    """Queries Delta's open orders for this product right after placing a bracketed
+    entry, to actually CONFIRM the stop-loss/take-profit orders exist rather than
+    trusting the entry order's success=true — this is a direct response to the entry
+    succeeding once while the bracket legs silently never attached (root cause: was
+    using order_type="market_order", now fixed to "limit_order", but this check stays
+    as a permanent safety net regardless of the underlying reason).
+
+    Returns {"verified": bool, "missing": [...], "open_orders_count": int} — or
+    {"verified": False, "reason": <str>} if the open-orders lookup itself failed.
+    """
+    try:
+        data = _get(f"/v2/orders?product_ids={product_id}&states=open")
+    except Exception as e:
+        return {"verified": False, "missing": [], "reason": f"Could not verify — open-orders lookup failed: {e}"}
+
+    orders = data.get("result", data) if isinstance(data, dict) else data
+    if not isinstance(orders, list):
+        return {"verified": False, "missing": [], "reason": f"Unexpected open-orders response: {data}"}
+
+    stop_order_types = {o.get("stop_order_type") for o in orders if isinstance(o, dict)}
+    has_sl = "stop_loss_order" in stop_order_types
+    has_tp = "take_profit_order" in stop_order_types
+
+    missing = []
+    if expect_sl and not has_sl:
+        missing.append("stop-loss")
+    if expect_tp and not has_tp:
+        missing.append("take-profit")
+
+    return {"verified": not missing, "missing": missing, "open_orders_count": len(orders)}
 
 
 def auto_place_order(delta_symbol: str, side: str, sl: float = None, tp: float = None) -> dict:
@@ -331,12 +386,40 @@ def auto_place_order(delta_symbol: str, side: str, sl: float = None, tp: float =
                    f"price=${mark_price}, contract_value={contract_value}) — trade skipped.")
             return {"ok": False, "dry_run": False, "raw": None, "error": err, "summary": err}
 
-        result = place_order(symbol=delta_symbol, side=side, quantity=contracts, order_type="market_order",
+        # Bracket fields (SL/TP) are only ever shown in Delta's docs paired with a
+        # limit_order entry, never market_order — and a market_order entry with brackets
+        # attached was observed to succeed while silently dropping the SL/TP legs. So:
+        # use an aggressively marketable limit price instead of a true market order,
+        # specifically to get the bracket fields honored while still filling immediately.
+        entry_slippage_pct = float(os.environ.get("DELTA_ENTRY_SLIPPAGE_PCT", "1.0"))
+        entry_buffer = mark_price * (entry_slippage_pct / 100)
+        marketable_limit = mark_price + entry_buffer if side.upper() == "BUY" else mark_price - entry_buffer
+
+        result = place_order(symbol=delta_symbol, side=side, quantity=contracts,
+                              order_type="limit_order", limit_price=round(marketable_limit, 2),
                               stop_loss_price=sl, take_profit_price=tp)
-        prefix = (f"AUTO {side.upper()} {contracts} x {delta_symbol} @ ~${mark_price:.2f} | "
-                  f"margin ${margin:.2f} ({CAPITAL_PCT:.0f}% of ${balance:.2f} balance) "
+        prefix = (f"AUTO {side.upper()} {contracts} x {delta_symbol} @ ~${mark_price:.2f} "
+                  f"(limit {marketable_limit:.2f}) | margin ${margin:.2f} "
+                  f"({CAPITAL_PCT:.0f}% of ${balance:.2f} balance) "
                   f"@ {leverage}x = ${notional:.2f} notional{bracket_desc}. ")
         result["summary"] = prefix + result.get("summary", "")
+
+        # Don't trust the entry's success=true for the bracket legs — confirm they
+        # actually exist. This is the safety net for exactly what already happened once:
+        # entry succeeds, SL/TP silently don't attach, and nobody finds out until it's
+        # too late on a naked 200x position.
+        if result["ok"] and (sl is not None or tp is not None):
+            check = verify_bracket_orders(product_id, expect_sl=sl is not None, expect_tp=tp is not None)
+            if not check["verified"]:
+                missing = check.get("missing") or [check.get("reason", "unknown")]
+                result["summary"] = (
+                    f"⚠️⚠️ POSITION OPEN WITHOUT FULL PROTECTION — MISSING: {', '.join(missing)} — "
+                    f"CHECK DELTA AND ADD MANUALLY NOW ⚠️⚠️\n" + result["summary"]
+                )
+                result["bracket_verified"] = False
+            else:
+                result["bracket_verified"] = True
+
         return result
     except Exception as e:
         return {"ok": False, "dry_run": False, "raw": None, "error": str(e), "summary": f"Auto-trade failed: {e}"}

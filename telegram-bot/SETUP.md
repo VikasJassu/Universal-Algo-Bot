@@ -310,6 +310,30 @@ outcomes instead, lower the leverage env vars below.
      live, not just the sizing math.
    - Only once that looks right, switch `DELTA_BASE_URL` back to production and use
      your real API key.
+   - **Known failure mode already fixed once, watch for it recurring:** an
+     `insufficient_margin` error where Delta's `required_additional_balance` +
+     `available_balance` implies a much lower effective leverage than what was
+     requested (e.g. margin math assumed 200x but Delta's numbers work out closer to
+     5x) means the leverage-set API call didn't actually get confirmed before the
+     order was sized. `set_leverage()` now checks Delta's response and raises before
+     placing the order if it isn't confirmed, so this should now surface as a clear
+     "Delta did not confirm Nx leverage on product X: {...}" error instead of a
+     confusing `insufficient_margin` rejection — if you still see the old confusing
+     version, something about leverage confirmation is failing again and the raw
+     Delta response in the error is the place to start.
+   - **Second known failure mode, also already fixed once:** the entry order reports
+     success but no stop-loss/take-profit actually shows up on Delta. Root cause: Delta's
+     docs only ever pair the `bracket_*` fields with `order_type: "limit_order"`, never
+     `market_order` — a market entry with brackets attached was observed to succeed
+     while silently dropping the SL/TP legs. Fixed by switching the entry to an
+     aggressively marketable `limit_order` (see `DELTA_ENTRY_SLIPPAGE_PCT`, default 1.0%
+     through the mark price — fills essentially immediately in practice). As a permanent
+     safety net on top of that fix, every bracketed auto-trade now does a follow-up
+     `GET /v2/orders` check to actually confirm the SL/TP orders exist — if they don't,
+     the Telegram message leads with `⚠️⚠️ POSITION OPEN WITHOUT FULL PROTECTION ⚠️⚠️`
+     instead of silently reporting a clean success. If you ever see that warning, go
+     add the stop manually on Delta immediately, then let me know so we can dig into
+     why verification failed that specific time.
 
 4. **Note on webhook timing:** the auto-trade path makes several sequential API calls
    to Delta (balance → product info → set leverage → mark price → place order with
