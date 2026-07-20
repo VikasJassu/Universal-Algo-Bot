@@ -324,25 +324,28 @@ outcomes instead, lower the leverage env vars below.
      confusing `insufficient_margin` rejection — if you still see the old confusing
      version, something about leverage confirmation is failing again and the raw
      Delta response in the error is the place to start.
-   - **Second known failure mode, fixed twice (architecture change on the second pass):**
-     the entry order reports success but no stop-loss/take-profit actually shows up on
-     Delta. First attempted fix: switch the entry to `order_type: "limit_order"` (Delta's
-     docs only ever pair `bracket_*` fields with limit entries in examples, never
-     `market_order`) — this did NOT resolve it; the SL/TP legs still silently failed to
-     attach even as a limit entry. Second fix, current behavior: stop attaching bracket
-     fields to the entry order at all. The entry is now a plain `market_order` (this part
-     has reliably worked in every test), and SL/TP are placed as a SEPARATE follow-up
-     call to Delta's dedicated `POST /v2/orders/bracket` endpoint once the position
-     exists — a genuinely different code path, not a parameter variation of the same
-     combined-call mechanism that failed twice. As a permanent safety net regardless of
-     which approach is in use, every bracketed auto-trade does a follow-up `GET /v2/orders`
-     check to actually confirm the SL/TP orders exist — if they don't, or if the bracket
-     call itself was rejected, the Telegram message leads with
+   - **Second known failure mode, fixed on the third attempt using real evidence:** the
+     entry order reports success but no stop-loss/take-profit actually shows up on
+     Delta. Two doc-based guesses both failed: (1) switching the entry to
+     `order_type: "limit_order"`, (2) splitting into a separate follow-up call to
+     Delta's dedicated `/v2/orders/bracket` endpoint. What actually fixed it: inspecting
+     a real network request captured from Delta's own web UI placing a bracket order,
+     which showed the correct structure is a SINGLE call to `/v2/orders` with
+     `order_type: "market_order"`, `product_id` (not `product_symbol`), bare
+     `bracket_stop_loss_price` / `bracket_take_profit_price` with **no** `*_limit_price`
+     sub-fields at all, and `bracket_stop_trigger_method: "mark_price"` (not
+     `"last_traded_price"`, which was an earlier guess from ambiguous docs). The code
+     now matches that captured request field-for-field. As a permanent safety net
+     regardless of confidence in the field structure, every bracketed auto-trade still
+     does a follow-up `GET /v2/orders` check to actually confirm the SL/TP orders exist
+     — if they don't, the Telegram message leads with
      `⚠️⚠️ POSITION OPEN WITHOUT FULL PROTECTION ⚠️⚠️` and includes Delta's exact
-     rejection reason, instead of silently reporting a clean success. If you ever see
-     that warning, go add the stop manually on Delta immediately, then send me the exact
-     summary text — the specific error is what tells us the next thing to fix, rather
-     than guessing again.
+     rejection reason. If you ever see that warning, go add the stop manually on Delta
+     immediately, then send the exact summary text — the specific error tells us the
+     next thing to fix, rather than guessing again.
+   - **If you have access to Delta's browser network tab again and something still looks
+     wrong**, capturing another real request (like the one that fixed this) is far more
+     reliable than iterating on docs guesses — that's what actually broke the cycle here.
 
 4. **Note on webhook timing:** the auto-trade path makes several sequential API calls
    to Delta (balance → product info → set leverage → mark price → place order with
