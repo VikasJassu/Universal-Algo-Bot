@@ -165,9 +165,12 @@ def place_order(symbol: str, side: str, quantity: int, order_type: str = None,
         return {"ok": False, "dry_run": False, "raw": None, "error": str(e), "summary": f"Order failed: {e}"}
 
 
-def place_bracket_market_order(delta_symbol: str, side: str, quantity: int, product_id,
-                                stop_loss_price: float, take_profit_price: float) -> dict:
-    """Places a market entry WITH a native Delta bracket attached, using the EXACT
+def place_entry_order(delta_symbol: str, side: str, quantity: int, product_id,
+                       stop_loss_price: float = None, take_profit_price: float = None,
+                       order_type: str = "market_order", limit_price: float = None,
+                       time_in_force: str = None) -> dict:
+    """Places the ENTRY order, optionally with a native Delta bracket attached (when both
+    stop_loss_price and take_profit_price are given). The market+bracket form is the EXACT
     payload Delta's own web UI sends (captured from the browser network tab):
 
         {"order_type":"market_order","side":"buy","product_id":<id>,
@@ -175,32 +178,39 @@ def place_bracket_market_order(delta_symbol: str, side: str, quantity: int, prod
          "bracket_take_profit_price":"<tp>","bracket_stop_loss_price":"<sl>",
          "bracket_stop_trigger_method":"mark_price","source":"desktop"}
 
-    This is byte-for-byte the request the UI issues, so if the bracket works in the UI
-    it works here. Delta fills the market entry immediately and then creates the SL and
-    TP as SEPARATE child orders (see verify_bracket_orders) — genuine native OCO, where
-    filling one leg auto-cancels the other.
+    That's byte-for-byte the UI request, so if the bracket works in the UI it works here.
+    order_type="limit_order" (+ limit_price) switches the entry to a marketable limit;
+    time_in_force is passed through when set. The bracket fields are identical either way
+    — Delta creates the SL/TP as SEPARATE child orders once the entry FILLS (see
+    verify_bracket_orders), which for a limit entry is after it's actually filled.
 
-    IMPORTANT: do NOT judge bracket success from result["result"]["bracket_order"]. On
-    a market entry that field is structurally null (the entry is already filled; the
-    bracket lives on as separate child orders, not on the entry record). Success of the
-    ENTRY is result["success"]; success of the BRACKET is confirmed by GET-ing the
-    child legs in verify_bracket_orders(), not from this response.
+    IMPORTANT: do NOT judge bracket success from result["result"]["bracket_order"]. On a
+    filled entry that field is structurally null (the entry is filled; the bracket lives
+    on as separate child orders, not on the entry record). Success of the ENTRY is
+    result["success"] (and, for a limit, that it actually fills); success of the BRACKET
+    is confirmed by GET-ing the child legs in verify_bracket_orders(), not from here.
 
     Returns Delta's raw parsed JSON response.
     """
     delta_side = "buy" if side.upper() == "BUY" else "sell"
     body_obj = {
-        "order_type": "market_order",
+        "order_type": order_type,
         "side": delta_side,
         "product_id": product_id,
         "reduce_only": "false",
         "order_source": "place_order",
         "size": int(quantity),
-        "bracket_take_profit_price": str(take_profit_price),
-        "bracket_stop_loss_price": str(stop_loss_price),
-        "bracket_stop_trigger_method": "mark_price",
-        "source": "desktop",
     }
+    if order_type == "limit_order" and limit_price is not None:
+        body_obj["limit_price"] = str(limit_price)
+    if time_in_force:
+        body_obj["time_in_force"] = time_in_force
+    if stop_loss_price is not None and take_profit_price is not None:
+        body_obj["bracket_take_profit_price"] = str(take_profit_price)
+        body_obj["bracket_stop_loss_price"] = str(stop_loss_price)
+        body_obj["bracket_stop_trigger_method"] = "mark_price"
+    body_obj["source"] = "desktop"
+
     body = json.dumps(body_obj, separators=(",", ":"))
     headers = _headers("POST", "/v2/orders", "", body)
     resp = requests.post(f"{BASE_URL}/v2/orders", data=body, headers=headers, timeout=10)
@@ -285,6 +295,27 @@ DEFAULT_LEVERAGE = {
 # before calling auto_place_order().
 BRACKET_TP_TIER = os.environ.get("DELTA_BRACKET_TP_TIER", "tp1").strip().lower()
 
+# ---- ENTRY ORDER TYPE ----
+# "limit"  (default): marketable limit — a limit order priced a small slippage cap
+#          beyond the alert's entry. Fills instantly if the market is within the cap,
+#          otherwise rests briefly and is CANCELLED after DELTA_ENTRY_TTL_SEC (so a
+#          stale order can never fill minutes later). This caps entry slippage — which
+#          on a tight scalp can otherwise exceed the whole take-profit distance.
+# "market": plain market order — always fills, at whatever price the book offers now
+#          (the old behavior; slippage uncapped).
+ENTRY_MODE = os.environ.get("DELTA_ENTRY_MODE", "limit").strip().lower()
+
+# Max slippage from the alert's entry price we'll accept on a marketable-limit entry,
+# as a PERCENT of the entry price. 0.05% of 1870 ≈ 0.94 pts; of 64297 ≈ 32 pts. The
+# limit is placed this far BEYOND the entry (above for a long, below for a short), so
+# the fill can never be worse than entry ± this. Set per the tightness of your targets.
+MAX_SLIPPAGE_PCT = float(os.environ.get("DELTA_MAX_SLIPPAGE_PCT", "0.05"))
+
+# How long (seconds) an unfilled marketable-limit entry may rest before it's cancelled.
+# Keeps the entry from filling long after the signal is stale. 0 => don't wait at all
+# (pure fill-now-or-skip). Note: this blocks the webhook request for up to this long.
+ENTRY_TTL_SEC = float(os.environ.get("DELTA_ENTRY_TTL_SEC", "8"))
+
 
 def match_auto_symbol(raw_ticker: str):
     """Returns the Delta product symbol (BTCUSD/ETHUSD/SOLUSD) if raw_ticker names one
@@ -311,6 +342,59 @@ def _post(path: str, body_obj: dict) -> dict:
     headers = _headers("POST", path, "", body)
     resp = requests.post(f"{BASE_URL}{path}", data=body, headers=headers, timeout=10)
     return resp.json()
+
+
+def _delete(path: str, body_obj: dict) -> dict:
+    body = json.dumps(body_obj, separators=(",", ":"))
+    headers = _headers("DELETE", path, "", body)
+    resp = requests.delete(f"{BASE_URL}{path}", data=body, headers=headers, timeout=10)
+    return resp.json()
+
+
+def cancel_order(product_id, order_id) -> dict:
+    """Cancels a single resting order (DELETE /v2/orders). Used to expire an unfilled
+    marketable-limit entry once its TTL elapses, so it can't fill after the signal is
+    stale."""
+    return _delete("/v2/orders", {"id": order_id, "product_id": product_id})
+
+
+def order_is_resting(product_id, order_id) -> bool:
+    """True if order_id is still sitting unfilled in the open/pending book for this
+    product. A marketable-limit entry disappears from here the instant it fills (it
+    becomes a closed order and spawns its bracket children under different ids), so
+    'still resting' == 'not yet filled'."""
+    data = _get(f"/v2/orders?product_ids={product_id}&states=open,pending")
+    orders = data.get("result", data) if isinstance(data, dict) else data
+    if not isinstance(orders, list):
+        return False
+    return any(isinstance(o, dict) and o.get("id") == order_id for o in orders)
+
+
+def _round_to_tick(price: float, tick: float) -> float:
+    """Delta rejects prices that aren't a multiple of the product's tick_size, so a
+    computed marketable-limit price has to be snapped to the nearest tick."""
+    if tick and tick > 0:
+        return round(round(price / tick) * tick, 8)
+    return round(price, 2)
+
+
+def _entry_is_filled(order_obj: dict) -> bool:
+    """Reads an order-placement response to see if the (limit) entry already filled.
+    A marketable limit that fills on placement comes back state=closed / unfilled_size=0;
+    one that rests comes back state=open with unfilled_size==size. Only a positive
+    signal counts as filled — anything ambiguous is treated as not-yet-filled and left
+    to the book poll in auto_place_order (which is authoritative)."""
+    if not isinstance(order_obj, dict):
+        return False
+    if order_obj.get("state") == "closed":
+        return True
+    unfilled = order_obj.get("unfilled_size")
+    if unfilled is not None:
+        try:
+            return int(unfilled) == 0
+        except (TypeError, ValueError):
+            return False
+    return False
 
 
 def get_available_balance_usd() -> float:
@@ -397,7 +481,7 @@ def verify_bracket_orders(product_id, expect_sl: bool, expect_tp: bool, retries:
             return {"verified": False, "missing": [], "reason": f"Unexpected open-orders response: {data}"}
 
         # Identify the protective legs. This must catch BOTH shapes we might create:
-        #   - native bracket child legs (from place_bracket_market_order): these carry
+        #   - native bracket child legs (from place_entry_order's bracket): these carry
         #     stop_order_type "stop_loss_order" / "take_profit_order" — both confirmed
         #     real values in Delta's docs. (The old check wrongly assumed take_profit_order
         #     didn't exist and that the TP leg had stop_order_type==None, so it missed
@@ -431,7 +515,8 @@ def verify_bracket_orders(product_id, expect_sl: bool, expect_tp: bool, retries:
     return {"verified": not missing, "missing": missing, "open_orders_count": len(orders), "raw": last_data}
 
 
-def auto_place_order(delta_symbol: str, side: str, sl: float = None, tp: float = None) -> dict:
+def auto_place_order(delta_symbol: str, side: str, sl: float = None, tp: float = None,
+                      entry: float = None) -> dict:
     """Full auto-size + auto-place flow, no manual confirm — called directly from the
     webhook handler the instant a BTC/ETH/SOL entry alert arrives.
 
@@ -442,21 +527,29 @@ def auto_place_order(delta_symbol: str, side: str, sl: float = None, tp: float =
         overrides which tier to use (tp1/tp2/tp3 — passed in by the caller already
         resolved). Since it's sized for the FULL position, hitting it closes the
         entire trade — this directly satisfies "close on TP1".
+    entry: the alert's entry price. Used as the reference for the marketable-limit cap
+        (see ENTRY MODE below). Optional — if missing, the entry falls back to a plain
+        market order regardless of DELTA_ENTRY_MODE (a limit needs a reference price).
 
-    PRE-ENTRY SANITY CHECK: a market order fills at the current mark price, not the
-    alert's entry price. If the market has already run past the TP (or SL) by the time
-    the order would fill, that leg can't be placed (Delta rejects it as
-    "bracket_order_immediate_execution") and the position would open unprotected. So the
-    trade is SKIPPED outright when the TP/SL is on the wrong side of the current price —
-    a stale alert is not entered. Normal trades (price still between SL and TP) are
-    unaffected.
+    ENTRY MODE (DELTA_ENTRY_MODE, default "limit"):
+    - "limit": a marketable limit priced DELTA_MAX_SLIPPAGE_PCT beyond `entry` (above for
+      a long, below for a short). Fills immediately if the market is within that cap;
+      otherwise it rests and is CANCELLED after DELTA_ENTRY_TTL_SEC and the trade is
+      SKIPPED (no position opened) — so a stale signal never fills late. This bounds
+      entry slippage, which on a tight scalp can otherwise exceed the whole TP distance.
+    - "market": plain market order, always fills at the going price (slippage uncapped).
+
+    PRE-ENTRY SANITY CHECK: regardless of mode, if the market has already run to the
+    wrong side of the TP (or SL) — so a protective leg would trigger instantly (Delta
+    rejects it as "bracket_order_immediate_execution") — the trade is SKIPPED outright.
+    For a long the TP must sit above and the SL below the current price; inverse short.
 
     HOW PROTECTION IS PLACED (in this order of preference):
-    1. If both sl and tp are given, place a native bracket market entry via
-       place_bracket_market_order() — the EXACT payload Delta's own web UI sends. This
-       gives real native OCO (filling one leg auto-cancels the other). Then confirm the
-       child legs actually exist via verify_bracket_orders() — NOT via the entry's
-       "bracket_order" field, which is structurally null on a filled market entry.
+    1. If both sl and tp are given, place a native bracket entry via place_entry_order()
+       — the EXACT bracket payload Delta's own web UI sends. This gives real native OCO
+       (filling one leg auto-cancels the other). Then confirm the child legs actually
+       exist via verify_bracket_orders() — NOT via the entry's "bracket_order" field,
+       which is structurally null on a filled entry.
     2. If verify can't find both legs, attach a bracket to the now-open position via
        the dedicated POST /v2/orders/bracket endpoint (attach_bracket_to_position()),
        then verify again.
@@ -482,10 +575,15 @@ def auto_place_order(delta_symbol: str, side: str, sl: float = None, tp: float =
     if tp is not None:
         bracket_desc += f" | TP {tp} (100% exit, not tiered)"
 
+    if ENTRY_MODE == "limit" and entry is not None:
+        entry_desc = f"marketable-limit (entry ${entry}, cap {MAX_SLIPPAGE_PCT}%, TTL {ENTRY_TTL_SEC:.0f}s)"
+    else:
+        entry_desc = "market"
+
     if not LIVE_TRADING:
         # Dry run makes zero external API calls (same policy as place_order) — so this
         # can't validate the sizing math end-to-end. Use Delta's testnet for that.
-        summary = (f"[DRY RUN] Would auto-place {side} on {delta_symbol} using "
+        summary = (f"[DRY RUN] Would auto-place {side} on {delta_symbol} ({entry_desc} entry) using "
                    f"{CAPITAL_PCT}% of balance as margin at {leverage}x leverage{bracket_desc}. "
                    f"Set LIVE_TRADING=true (ideally against testnet first) to see real numbers.")
         return {"ok": True, "dry_run": True, "raw": None, "error": None, "summary": summary}
@@ -501,6 +599,7 @@ def auto_place_order(delta_symbol: str, side: str, sl: float = None, tp: float =
         contract_value = float(product.get("contract_value") or 0)
         if contract_value <= 0:
             raise RuntimeError(f"Invalid contract_value for {delta_symbol}: {product}")
+        tick_size = float(product.get("tick_size") or 0)
 
         set_leverage(product_id, leverage)
 
@@ -546,26 +645,71 @@ def auto_place_order(delta_symbol: str, side: str, sl: float = None, tp: float =
         close_side = "SELL" if side.upper() == "BUY" else "BUY"
         want_bracket = sl is not None and tp is not None
 
-        # ---- Step 1: entry (native bracket market order if we have both SL and TP) ----
-        if want_bracket:
-            try:
-                entry_raw = place_bracket_market_order(delta_symbol, side, contracts, product_id, sl, tp)
-            except Exception as e:
-                return {"ok": False, "dry_run": False, "raw": None, "error": str(e),
-                        "summary": prefix + f"Bracket-entry call failed: {e}"}
-            if not (isinstance(entry_raw, dict) and entry_raw.get("success")):
-                return {"ok": False, "dry_run": False, "raw": entry_raw,
-                        "error": str(entry_raw), "summary": prefix + f"Delta rejected the order: {entry_raw}"}
-            result = {"ok": True, "dry_run": False, "raw": entry_raw, "error": None,
-                      "summary": f"{contracts} x {delta_symbol} submitted to Delta Exchange (native bracket)."}
-        else:
-            # Only one (or neither) of sl/tp — a native bracket needs both, so plain entry.
-            result = place_order(symbol=delta_symbol, side=side, quantity=contracts,
-                                  order_type="market_order", product_id=product_id, reduce_only=False)
+        # ---- Decide the entry order type: marketable limit (default) or plain market ----
+        # A marketable limit needs the alert's entry price as its reference; without it we
+        # can only fall back to a market order.
+        use_limit = ENTRY_MODE == "limit" and entry is not None
+        entry_order_type = "market_order"
+        limit_price = None
+        tif = None
+        if use_limit:
+            cap = entry * (MAX_SLIPPAGE_PCT / 100.0)
+            # Priced BEYOND entry (buy above / sell below) so it's immediately marketable
+            # if price is within the cap, but never fills worse than entry ± cap.
+            limit_price = _round_to_tick(entry + cap if is_long else entry - cap, tick_size)
+            entry_order_type = "limit_order"
+            tif = "gtc"  # rests until filled or WE cancel it after ENTRY_TTL_SEC
 
-        result["summary"] = prefix + result.get("summary", "")
-        if not result["ok"]:
-            return result  # entry failed outright — nothing opened, nothing to protect
+        # ---- Step 1: place the entry (native bracket attached when both sl and tp given) ----
+        try:
+            entry_raw = place_entry_order(
+                delta_symbol, side, contracts, product_id,
+                stop_loss_price=sl if want_bracket else None,
+                take_profit_price=tp if want_bracket else None,
+                order_type=entry_order_type, limit_price=limit_price, time_in_force=tif)
+        except Exception as e:
+            return {"ok": False, "dry_run": False, "raw": None, "error": str(e),
+                    "summary": prefix + f"Entry call failed: {e}"}
+        if not (isinstance(entry_raw, dict) and entry_raw.get("success")):
+            return {"ok": False, "dry_run": False, "raw": entry_raw,
+                    "error": str(entry_raw), "summary": prefix + f"Delta rejected the order: {entry_raw}"}
+
+        order_obj = entry_raw.get("result") if isinstance(entry_raw.get("result"), dict) else {}
+        order_id = order_obj.get("id")
+
+        # ---- For a marketable limit: wait for the fill, and CANCEL + skip if it doesn't
+        # arrive within ENTRY_TTL_SEC (so a stale entry never fills late). ----
+        if use_limit and order_id is not None:
+            filled = _entry_is_filled(order_obj)
+            if not filled:
+                try:
+                    filled = not order_is_resting(product_id, order_id)  # instant-fill fast path
+                except Exception:
+                    filled = False
+            waited = 0.0
+            while not filled and waited < ENTRY_TTL_SEC:
+                nap = min(1.5, ENTRY_TTL_SEC - waited)
+                time.sleep(nap)
+                waited += nap
+                try:
+                    filled = not order_is_resting(product_id, order_id)
+                except Exception:
+                    filled = False
+            if not filled:
+                try:
+                    cancel_order(product_id, order_id)
+                except Exception:
+                    pass
+                err = (f"Trade SKIPPED — marketable-limit entry @ ${limit_price} didn't fill within "
+                       f"{ENTRY_TTL_SEC:.0f}s (price stayed beyond the {MAX_SLIPPAGE_PCT}% slippage "
+                       f"cap from entry ${entry}). Order cancelled; no position opened.")
+                return {"ok": False, "dry_run": False, "raw": entry_raw, "error": err,
+                        "summary": prefix + err}
+
+        entry_label = "native bracket" if want_bracket else "entry"
+        mode_label = f"marketable-limit @ ${limit_price}" if use_limit else "market"
+        result = {"ok": True, "dry_run": False, "raw": entry_raw, "error": None,
+                  "summary": prefix + f"{contracts} x {delta_symbol} filled ({mode_label}, {entry_label})."}
 
         if sl is None and tp is None:
             result["bracket_verified"] = None  # no protection requested

@@ -330,7 +330,13 @@ def webhook():
                 tp_price = float(parsed.get(delta_exchange_client.BRACKET_TP_TIER, parsed.get("tp1")))
             except (TypeError, ValueError):
                 tp_price = None
-            auto_result = delta_exchange_client.auto_place_order(auto_symbol, side, sl=sl_price, tp=tp_price)
+            # entry price drives the marketable-limit slippage cap (see auto_place_order).
+            try:
+                entry_price = float(parsed["entry"])
+            except (KeyError, TypeError, ValueError):
+                entry_price = None
+            auto_result = delta_exchange_client.auto_place_order(
+                auto_symbol, side, sl=sl_price, tp=tp_price, entry=entry_price)
             if auto_result["dry_run"]:
                 tag = "🤖 DRY RUN (auto-trade)"
             elif auto_result["ok"]:
