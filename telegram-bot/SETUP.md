@@ -282,15 +282,16 @@ outcomes instead, lower the leverage env vars below.
    DELTA_BRACKET_TRIGGER=last_traded_price
    ```
 
-2. **What gets placed:** every auto-trade places a plain entry, then separately attaches
-   a stop-loss AND a take-profit via Delta's bracket endpoint — the position isn't naked
+2. **What gets placed:** every auto-trade places a plain entry, then places a stop-loss
+   AND a take-profit as two independent `reduce_only` orders (not via Delta's bracket
+   feature — see the failure-mode notes below for why) — the position isn't naked
    anymore. Both prices come straight from the alert (the Pine script already computes
    them). The take-profit is sized for the FULL position, so **hitting it closes the
    entire trade automatically** — no separate "close on TP1" logic needed, this is just
    what a full-size take-profit order does when it fills. **Important:** the take-profit
    is a single price (TP1 by default, `DELTA_BRACKET_TP_TIER`) — this does **not**
    replicate the Pine script's tiered 50%/30%/20% partial-exit display. If you want the
-   bot to actually mirror that tiering (3 separate bracket orders, plus moving the SL to
+   bot to actually mirror that tiering (3 separate SL/TP order pairs, plus moving the SL to
    breakeven when a TP1-hit alert later arrives), that's a bigger follow-up feature —
    ask for it explicitly.
 
@@ -324,34 +325,34 @@ outcomes instead, lower the leverage env vars below.
      confusing `insufficient_margin` rejection — if you still see the old confusing
      version, something about leverage confirmation is failing again and the raw
      Delta response in the error is the place to start.
-   - **Second known failure mode, fixed on the third attempt using real evidence:** the
-     entry order reports success but no stop-loss/take-profit actually shows up on
-     Delta. Two doc-based guesses both failed: (1) switching the entry to
-     `order_type: "limit_order"`, (2) splitting into a separate follow-up call to
-     Delta's dedicated `/v2/orders/bracket` endpoint. What actually fixed it: inspecting
-     a real network request captured from Delta's own web UI placing a bracket order,
-     which showed the correct structure is a SINGLE call to `/v2/orders` with
-     `order_type: "market_order"`, `product_id` (not `product_symbol`), bare
-     `bracket_stop_loss_price` / `bracket_take_profit_price` with **no** `*_limit_price`
-     sub-fields at all, and `bracket_stop_trigger_method: "mark_price"` (not
-     `"last_traded_price"`, which was an earlier guess from ambiguous docs). The code
-     now matches that captured request field-for-field. As a permanent safety net
-     regardless of confidence in the field structure, every bracketed auto-trade still
-     does a follow-up `GET /v2/orders` check to actually confirm the SL/TP orders exist
-     — if they don't, the Telegram message leads with
-     `⚠️⚠️ POSITION OPEN WITHOUT FULL PROTECTION ⚠️⚠️` and includes Delta's exact
-     rejection reason. If you ever see that warning, go add the stop manually on Delta
-     immediately, then send the exact summary text — the specific error tells us the
-     next thing to fix, rather than guessing again.
-   - **If you have access to Delta's browser network tab again and something still looks
-     wrong**, capturing another real request (like the one that fixed this) is far more
-     reliable than iterating on docs guesses — that's what actually broke the cycle here.
-   - **The warning message now includes Delta's raw response for both the entry call and
-     the open-orders verification check**, so if it recurs there's enough in the Telegram
-     message itself to diagnose without another round-trip. `verify_bracket_orders()` also
-     now retries up to twice with a short delay before reporting missing, in case there's
-     propagation lag between the order succeeding and the bracket child orders becoming
-     visible via the follow-up GET.
+   - **Second known failure mode — Delta's "bracket" mechanism does not actually attach
+     SL/TP, in any tested form.** Three different attempts, all confirmed to fail:
+     (1) `bracket_*` fields on a `market_order` entry, (2) same fields but
+     `order_type: "limit_order"`, (3) a separate follow-up call to Delta's dedicated
+     `/v2/orders/bracket` endpoint. Even after matching a request captured live from
+     Delta's own web UI field-for-field, a real testnet trade still came back with no
+     SL/TP attached — and the raw response proved it: `bracket_stop_loss_price` was
+     echoed back into the order record, but Delta's own `"bracket_order"` field (which
+     is only populated when a bracket genuinely links to the order) was `null`, and
+     `"stop_order_type"` was also `null`. **Current, working approach:** stop using
+     Delta's bracket feature at all. SL/TP are now placed as two independent
+     `reduce_only` orders right after the entry — a stop-market order for SL
+     (`stop_order_type: "stop_loss_order"`, the one bracket-adjacent field actually
+     confirmed by Delta's docs) and a plain `reduce_only` limit order for TP (no special
+     mechanism needed for that leg at all). This is the standard, exchange-agnostic
+     pattern rather than anything Delta-specific, which is exactly why it doesn't depend
+     on guessing Delta's undocumented bracket internals correctly.
+   - **The safety net is unchanged in spirit**: every auto-trade with SL/TP still does a
+     follow-up `GET /v2/orders` check (with retries, in case of propagation lag) to
+     confirm BOTH legs actually exist as open orders — if either is missing, or either
+     leg's own placement call was rejected, the Telegram message leads with
+     `⚠️⚠️ POSITION OPEN WITHOUT FULL PROTECTION ⚠️⚠️`, names which leg specifically
+     failed, and includes Delta's raw rejection response. If you ever see that warning,
+     add the stop manually on Delta immediately, then send the exact summary text.
+   - **If you have access to Delta's browser network tab and something still looks
+     wrong**, capturing a real request (placing a plain reduce_only stop order manually
+     through the UI, this time) is far more reliable than iterating on docs guesses —
+     that's what finally diagnosed the actual root cause here.
    - **Double-check `DELTA_LEVERAGE_BTC`/`_ETH`/`_SOL` are actually set to what you
      intend.** Check `delta_auto_trade_leverage` on `/debug` — if the leverage used in a
      trade summary doesn't match what you configured, the env var value on Render is the
