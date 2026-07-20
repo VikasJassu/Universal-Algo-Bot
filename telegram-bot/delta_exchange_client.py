@@ -285,37 +285,45 @@ def get_mark_price(delta_symbol: str) -> float:
     return float(price)
 
 
-def verify_bracket_orders(product_id, expect_sl: bool, expect_tp: bool) -> dict:
+def verify_bracket_orders(product_id, expect_sl: bool, expect_tp: bool, retries: int = 2, retry_delay: float = 1.5) -> dict:
     """Queries Delta's open orders for this product right after placing a bracketed
     entry, to actually CONFIRM the stop-loss/take-profit orders exist rather than
-    trusting the entry order's success=true — this is a direct response to the entry
-    succeeding once while the bracket legs silently never attached (root cause: was
-    using order_type="market_order", now fixed to "limit_order", but this check stays
-    as a permanent safety net regardless of the underlying reason).
+    trusting the entry order's success=true. Retries a couple times with a short delay
+    in case there's propagation lag between the order call succeeding and the child
+    bracket orders becoming visible via this GET — checked immediately after the write,
+    a race here would look identical to the bracket never having been created at all.
 
-    Returns {"verified": bool, "missing": [...], "open_orders_count": int} — or
-    {"verified": False, "reason": <str>} if the open-orders lookup itself failed.
+    Returns {"verified": bool, "missing": [...], "open_orders_count": int, "raw": <last
+    response>} — or {"verified": False, "reason": <str>} if the lookup itself failed.
     """
-    try:
-        data = _get(f"/v2/orders?product_ids={product_id}&states=open")
-    except Exception as e:
-        return {"verified": False, "missing": [], "reason": f"Could not verify — open-orders lookup failed: {e}"}
+    last_data = None
+    for attempt in range(retries + 1):
+        if attempt > 0:
+            time.sleep(retry_delay)
+        try:
+            data = _get(f"/v2/orders?product_ids={product_id}&states=open")
+        except Exception as e:
+            return {"verified": False, "missing": [], "reason": f"Could not verify — open-orders lookup failed: {e}"}
+        last_data = data
 
-    orders = data.get("result", data) if isinstance(data, dict) else data
-    if not isinstance(orders, list):
-        return {"verified": False, "missing": [], "reason": f"Unexpected open-orders response: {data}"}
+        orders = data.get("result", data) if isinstance(data, dict) else data
+        if not isinstance(orders, list):
+            return {"verified": False, "missing": [], "reason": f"Unexpected open-orders response: {data}"}
 
-    stop_order_types = {o.get("stop_order_type") for o in orders if isinstance(o, dict)}
-    has_sl = "stop_loss_order" in stop_order_types
-    has_tp = "take_profit_order" in stop_order_types
+        stop_order_types = {o.get("stop_order_type") for o in orders if isinstance(o, dict)}
+        has_sl = "stop_loss_order" in stop_order_types
+        has_tp = "take_profit_order" in stop_order_types
 
-    missing = []
-    if expect_sl and not has_sl:
-        missing.append("stop-loss")
-    if expect_tp and not has_tp:
-        missing.append("take-profit")
+        missing = []
+        if expect_sl and not has_sl:
+            missing.append("stop-loss")
+        if expect_tp and not has_tp:
+            missing.append("take-profit")
 
-    return {"verified": not missing, "missing": missing, "open_orders_count": len(orders)}
+        if not missing:
+            break  # found on this attempt, no need to retry further
+
+    return {"verified": not missing, "missing": missing, "open_orders_count": len(orders), "raw": last_data}
 
 
 def auto_place_order(delta_symbol: str, side: str, sl: float = None, tp: float = None) -> dict:
@@ -410,9 +418,17 @@ def auto_place_order(delta_symbol: str, side: str, sl: float = None, tp: float =
                 reasons = list(check.get("missing") or [])
                 if check.get("reason"):
                     reasons.append(check["reason"])
+                # Include BOTH raw responses so a next failure is diagnosable from the
+                # Telegram message alone, without another round-trip to ask for them —
+                # the entry call's own response (which included the bracket_* fields —
+                # if Delta silently ignored them or rejected just that part, it may say
+                # so here even though the top-level order still succeeded) and what the
+                # open-orders check actually saw.
                 result["summary"] = (
                     f"⚠️⚠️ POSITION OPEN WITHOUT FULL PROTECTION — {'; '.join(reasons)} — "
-                    f"CHECK DELTA AND ADD MANUALLY NOW ⚠️⚠️\n" + result["summary"]
+                    f"CHECK DELTA AND ADD MANUALLY NOW ⚠️⚠️\n" + result["summary"] +
+                    f"\nEntry response: {result.get('raw')}" +
+                    f"\nOpen-orders check: {check.get('raw')}"
                 )
                 result["bracket_verified"] = False
             else:

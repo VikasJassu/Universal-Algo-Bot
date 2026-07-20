@@ -346,6 +346,16 @@ outcomes instead, lower the leverage env vars below.
    - **If you have access to Delta's browser network tab again and something still looks
      wrong**, capturing another real request (like the one that fixed this) is far more
      reliable than iterating on docs guesses — that's what actually broke the cycle here.
+   - **The warning message now includes Delta's raw response for both the entry call and
+     the open-orders verification check**, so if it recurs there's enough in the Telegram
+     message itself to diagnose without another round-trip. `verify_bracket_orders()` also
+     now retries up to twice with a short delay before reporting missing, in case there's
+     propagation lag between the order succeeding and the bracket child orders becoming
+     visible via the follow-up GET.
+   - **Double-check `DELTA_LEVERAGE_BTC`/`_ETH`/`_SOL` are actually set to what you
+     intend.** Check `delta_auto_trade_leverage` on `/debug` — if the leverage used in a
+     trade summary doesn't match what you configured, the env var value on Render is the
+     first thing to check, not the code.
 
 4. **Note on webhook timing:** the auto-trade path makes several sequential API calls
    to Delta (balance → product info → set leverage → mark price → place order with
