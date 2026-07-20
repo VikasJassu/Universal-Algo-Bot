@@ -443,6 +443,14 @@ def auto_place_order(delta_symbol: str, side: str, sl: float = None, tp: float =
         resolved). Since it's sized for the FULL position, hitting it closes the
         entire trade — this directly satisfies "close on TP1".
 
+    PRE-ENTRY SANITY CHECK: a market order fills at the current mark price, not the
+    alert's entry price. If the market has already run past the TP (or SL) by the time
+    the order would fill, that leg can't be placed (Delta rejects it as
+    "bracket_order_immediate_execution") and the position would open unprotected. So the
+    trade is SKIPPED outright when the TP/SL is on the wrong side of the current price —
+    a stale alert is not entered. Normal trades (price still between SL and TP) are
+    unaffected.
+
     HOW PROTECTION IS PLACED (in this order of preference):
     1. If both sl and tp are given, place a native bracket market entry via
        place_bracket_market_order() — the EXACT payload Delta's own web UI sends. This
@@ -510,6 +518,30 @@ def auto_place_order(delta_symbol: str, side: str, sl: float = None, tp: float =
         prefix = (f"AUTO {side.upper()} {contracts} x {delta_symbol} @ ~${mark_price:.2f} | "
                   f"margin ${margin:.2f} ({CAPITAL_PCT:.0f}% of ${balance:.2f} balance) "
                   f"@ {leverage}x = ${notional:.2f} notional{bracket_desc}. ")
+
+        # ---- Pre-entry sanity check: is the protection still on the right side of the
+        # market? A market order fills at mark_price, NOT the alert's entry price. If the
+        # market has already run past the take-profit (or stop), that leg would trigger
+        # instantly — Delta rejects it with "bracket_order_immediate_execution" and the
+        # position opens without full protection. For a LONG the TP must sit ABOVE and
+        # the SL BELOW the current price; inverse for a SHORT. If either is on the wrong
+        # side, the alert was stale by the time it reached the market — skip the trade
+        # entirely rather than open an unprotectable/already-past-target position. ----
+        is_long = side.upper() == "BUY"
+        stale = []
+        if tp is not None and ((is_long and tp <= mark_price) or (not is_long and tp >= mark_price)):
+            stale.append(f"TP {tp} is already {'below' if is_long else 'above'} the current price "
+                         f"${mark_price:.2f} ({'long' if is_long else 'short'} needs TP "
+                         f"{'above' if is_long else 'below'})")
+        if sl is not None and ((is_long and sl >= mark_price) or (not is_long and sl <= mark_price)):
+            stale.append(f"SL {sl} is already {'above' if is_long else 'below'} the current price "
+                         f"${mark_price:.2f} ({'long' if is_long else 'short'} needs SL "
+                         f"{'below' if is_long else 'above'})")
+        if stale:
+            err = (f"Trade SKIPPED — price ran past protection before the order could fill: "
+                   f"{'; '.join(stale)}. The entry alert was stale (market moved from the "
+                   f"alert's entry to ${mark_price:.2f}). No position opened.")
+            return {"ok": False, "dry_run": False, "raw": None, "error": err, "summary": prefix + err}
 
         close_side = "SELL" if side.upper() == "BUY" else "BUY"
         want_bracket = sl is not None and tp is not None
