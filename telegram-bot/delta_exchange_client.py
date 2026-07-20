@@ -537,7 +537,11 @@ def auto_place_order(delta_symbol: str, side: str, sl: float = None, tp: float =
       otherwise it rests and is CANCELLED after DELTA_ENTRY_TTL_SEC and the trade is
       SKIPPED (no position opened) — so a stale signal never fills late. This bounds
       entry slippage, which on a tight scalp can otherwise exceed the whole TP distance.
-    - "market": plain market order, always fills at the going price (slippage uncapped).
+    - "market": plain market order. It can't cap its own fill, so DELTA_MAX_SLIPPAGE_PCT
+      is enforced as a PRE-ENTRY gate instead — if the market has already moved adversely
+      more than the cap from `entry` (up for a long, down for a short), the trade is
+      SKIPPED as stale rather than filled at a bad price. Same protection as limit mode,
+      minus the guaranteed-price fill.
 
     PRE-ENTRY SANITY CHECK: regardless of mode, if the market has already run to the
     wrong side of the TP (or SL) — so a protective leg would trigger instantly (Delta
@@ -659,6 +663,22 @@ def auto_place_order(delta_symbol: str, side: str, sl: float = None, tp: float =
             limit_price = _round_to_tick(entry + cap if is_long else entry - cap, tick_size)
             entry_order_type = "limit_order"
             tif = "gtc"  # rests until filled or WE cancel it after ENTRY_TTL_SEC
+        elif entry is not None:
+            # MARKET mode: a market order fills at the current price with no cap of its
+            # own, so enforce the SAME DELTA_MAX_SLIPPAGE_PCT as a pre-entry gate. If the
+            # market has already moved ADVERSELY more than the cap from the alert's entry
+            # (up for a long, down for a short), a market fill would be worse than we'd
+            # accept — skip as stale rather than open at a bad price. (Favorable moves are
+            # allowed through, exactly like the marketable-limit path.)
+            cap = entry * (MAX_SLIPPAGE_PCT / 100.0)
+            adverse = (mark_price - entry) if is_long else (entry - mark_price)
+            if adverse > cap:
+                err = (f"Trade SKIPPED — market-entry slippage too high: price is at "
+                       f"${mark_price:.2f}, more than {MAX_SLIPPAGE_PCT}% (${cap:.2f}) "
+                       f"{'above' if is_long else 'below'} the alert entry ${entry}. A market "
+                       f"fill would breach the slippage cap. No position opened.")
+                return {"ok": False, "dry_run": False, "raw": None, "error": err,
+                        "summary": prefix + err}
 
         # ---- Step 1: place the entry (native bracket attached when both sl and tp given) ----
         try:
