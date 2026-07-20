@@ -353,6 +353,13 @@ outcomes instead, lower the leverage env vars below.
      wrong**, capturing a real request (placing a plain reduce_only stop order manually
      through the UI, this time) is far more reliable than iterating on docs guesses —
      that's what finally diagnosed the actual root cause here.
+   - **Third bug, found from a screenshot of Delta's own UI**: the verification check
+     was querying `states=open` only. Delta's UI splits orders into separate "Open
+     Orders" and "Stop Orders" tabs — matching the API's own state model, where a stop
+     order sits in `"pending"` state (waiting for its trigger) rather than `"open"`
+     (resting in the orderbook) until it actually triggers. A `states=open`-only query
+     could never find the SL leg, producing a false "missing" warning even when the
+     order genuinely existed. Fixed to query `states=open,pending`.
    - **Double-check `DELTA_LEVERAGE_BTC`/`_ETH`/`_SOL` are actually set to what you
      intend.** Check `delta_auto_trade_leverage` on `/debug` — if the leverage used in a
      trade summary doesn't match what you configured, the env var value on Render is the

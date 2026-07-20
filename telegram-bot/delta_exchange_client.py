@@ -291,6 +291,13 @@ def verify_bracket_orders(product_id, expect_sl: bool, expect_tp: bool, retries:
     verify_bracket_orders for now even though nothing here is a Delta "bracket" order
     anymore — it verifies "the SL/TP protection", regardless of the underlying mechanism.)
 
+    ⚠️ Queries states=open,pending — NOT just "open". Delta's own docs distinguish
+    "open" (resting in the orderbook, e.g. the TP limit order) from "pending" (waiting
+    for its trigger condition — exactly what a stop order is before price reaches it).
+    A states=open-only query would NEVER find the stop-loss leg, confirmed by Delta's
+    own web UI splitting "Open Orders" and "Stop Orders" into separate tabs — this was
+    a real bug here (false "missing" on the SL leg even when it genuinely existed).
+
     Returns {"verified": bool, "missing": [...], "open_orders_count": int, "raw": <last
     response>} — or {"verified": False, "reason": <str>} if the lookup itself failed.
     """
@@ -299,7 +306,7 @@ def verify_bracket_orders(product_id, expect_sl: bool, expect_tp: bool, retries:
         if attempt > 0:
             time.sleep(retry_delay)
         try:
-            data = _get(f"/v2/orders?product_ids={product_id}&states=open")
+            data = _get(f"/v2/orders?product_ids={product_id}&states=open,pending")
         except Exception as e:
             return {"verified": False, "missing": [], "reason": f"Could not verify — open-orders lookup failed: {e}"}
         last_data = data
