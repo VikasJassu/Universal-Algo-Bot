@@ -14,12 +14,14 @@ Optional:
   DELTA_BASE_URL    (default "https://api.india.delta.exchange")
   DELTA_ORDER_TYPE  (default "market_order"; other option "limit_order")
 
-Auto-trade (BTC/ETH/SOL only, no manual confirm — see the AUTO-TRADE section below):
+Auto-trade (BTC/ETH/SOL/PAXG/XAUT only, no manual confirm — see the AUTO-TRADE section below):
   DELTA_AUTO_TRADE_CRYPTO  (default "true")
   DELTA_CAPITAL_PCT        (default "15" — percent of balance used as margin, per symbol)
   DELTA_LEVERAGE_BTC       (default "200")
   DELTA_LEVERAGE_ETH       (default "200")
   DELTA_LEVERAGE_SOL       (default "100" — Delta's actual max for SOLUSD)
+  DELTA_LEVERAGE_PAXG      (default "100" — Delta's actual max for PAXGUSD, gold token)
+  DELTA_LEVERAGE_XAUT      (default "100" — Delta's actual max for XAUTUSD, gold token)
   DELTA_BRACKET_TP_TIER    (default "tp1" — which of the alert's tp1/tp2/tp3 to use as
                              the take-profit price; position exits 100% there, not tiered)
 
@@ -249,23 +251,24 @@ def attach_bracket_to_position(product_id, stop_loss_price: float,
 
 
 # ============================================================
-# AUTO-TRADE: BTC / ETH / SOL only — no manual confirm tap.
+# AUTO-TRADE: BTC / ETH / SOL / PAXG / XAUT only — no manual confirm tap.
 #
 # Triggered directly from webhook_bot.py the instant an entry alert for one of these
-# three arrives. Position size = DELTA_CAPITAL_PCT of current wallet balance (default
-# 15%), used as MARGIN, independently PER SYMBOL — so BTC, ETH, and SOL can each use
-# their own 15% slice of balance (up to 45% combined exposure if all three fire close
-# together). Leverage is set automatically per symbol before the order is placed.
+# five arrives. Position size = DELTA_CAPITAL_PCT of current wallet balance (default
+# 15%), used as MARGIN, independently PER SYMBOL — so BTC, ETH, SOL, PAXG, and XAUT can
+# each use their own 15% slice of balance (up to 75% combined exposure if all five fire
+# close together). Leverage is set automatically per symbol before the order is placed.
 #
 # ⚠️ LEVERAGE — EXPLICITLY CONFIRMED, NOT A DEFAULT TO TRUST BLINDLY:
-# BTCUSD/ETHUSD default to 200x (Delta's max), SOLUSD to 100x (Delta's actual max for
-# that product — 200x isn't offered there). At 200x, Delta's forced liquidation
-# triggers at roughly a 0.5% adverse price move, well inside normal 5-minute BTC/ETH
-# candle ranges. In practice this means the EXCHANGE's liquidation engine, not the
-# indicator's own ATR-based stop-loss, decides the exit on most losing trades —
-# consuming the full margin allocated to that symbol rather than the smaller loss the
-# strategy's SL was sized for. This was surfaced explicitly and confirmed as intended.
-# Change DELTA_LEVERAGE_BTC / DELTA_LEVERAGE_ETH / DELTA_LEVERAGE_SOL to lower it.
+# BTCUSD/ETHUSD default to 200x (Delta's max), SOLUSD/PAXGUSD/XAUTUSD to 100x (Delta's
+# actual max for those products — 200x isn't offered there). At 200x, Delta's forced
+# liquidation triggers at roughly a 0.5% adverse price move, well inside normal 5-minute
+# BTC/ETH candle ranges; even at 100x the gold tokens liquidate near a ~1% move. In
+# practice this means the EXCHANGE's liquidation engine, not the indicator's own ATR-based
+# stop-loss, decides the exit on most losing trades — consuming the full margin allocated
+# to that symbol rather than the smaller loss the strategy's SL was sized for. This was
+# surfaced explicitly and confirmed as intended. Change DELTA_LEVERAGE_BTC / _ETH / _SOL /
+# _PAXG / _XAUT to lower it.
 #
 # ⚠️ FIELD NAMES: the wallet-balance and ticker response shapes below are built from
 # Delta's docs + published Python SDK examples, but were NOT verified against a live
@@ -278,7 +281,18 @@ def attach_bracket_to_position(product_id, stop_loss_price: float,
 # only entries. Exits still require manual action on Delta's app, same as before.
 # ============================================================
 
-AUTO_CRYPTO_SYMBOLS = {"BTC": "BTCUSD", "ETH": "ETHUSD", "SOL": "SOLUSD"}
+# Maps a substring that identifies the asset (matched against the alert's raw ticker) to
+# Delta's product_symbol for that perpetual. PAXG (Pax Gold) and XAUT (Tether Gold) are
+# gold-pegged tokens — both are live perpetuals on Delta India (PAXGUSD / XAUTUSD), so a
+# TradingView "PAXGUSD.P" / "XAUTUSD.P" alert routes straight to the same auto-trade path
+# as BTC/ETH/SOL. None of these five substrings overlap, so iteration order is irrelevant.
+AUTO_CRYPTO_SYMBOLS = {
+    "BTC": "BTCUSD",
+    "ETH": "ETHUSD",
+    "SOL": "SOLUSD",
+    "PAXG": "PAXGUSD",
+    "XAUT": "XAUTUSD",
+}
 
 AUTO_TRADE_ENABLED = os.environ.get("DELTA_AUTO_TRADE_CRYPTO", "true").strip().lower() == "true"
 CAPITAL_PCT = float(os.environ.get("DELTA_CAPITAL_PCT", "15"))
@@ -287,6 +301,10 @@ DEFAULT_LEVERAGE = {
     "BTCUSD": int(os.environ.get("DELTA_LEVERAGE_BTC", "200")),
     "ETHUSD": int(os.environ.get("DELTA_LEVERAGE_ETH", "200")),
     "SOLUSD": int(os.environ.get("DELTA_LEVERAGE_SOL", "100")),
+    # Gold tokens — Delta caps both at 100x (initial_margin 1%). 100x on gold is still
+    # very aggressive; lower these via the env vars if you want more breathing room.
+    "PAXGUSD": int(os.environ.get("DELTA_LEVERAGE_PAXG", "100")),
+    "XAUTUSD": int(os.environ.get("DELTA_LEVERAGE_XAUT", "100")),
 }
 
 # Which of the alert's tp1/tp2/tp3 to attach as the bracket take-profit — the position
@@ -318,10 +336,10 @@ ENTRY_TTL_SEC = float(os.environ.get("DELTA_ENTRY_TTL_SEC", "8"))
 
 
 def match_auto_symbol(raw_ticker: str):
-    """Returns the Delta product symbol (BTCUSD/ETHUSD/SOLUSD) if raw_ticker names one
-    of the auto-trade assets (e.g. TradingView's "BTCUSD", "BINANCE:BTCUSDT.P", etc all
-    contain "BTC"), else None. BTC/ETH/SOL don't overlap as substrings so check order
-    doesn't matter here."""
+    """Returns the Delta product symbol (BTCUSD/ETHUSD/SOLUSD/PAXGUSD/XAUTUSD) if
+    raw_ticker names one of the auto-trade assets (e.g. TradingView's "BTCUSD",
+    "BINANCE:BTCUSDT.P", "PAXGUSD.P", "XAUTUSD.P" etc all contain the asset substring),
+    else None. The five substrings don't overlap so check order doesn't matter here."""
     if not raw_ticker:
         return None
     t = raw_ticker.upper()

@@ -249,23 +249,30 @@ now arrives in Telegram with three buttons:
    Optional (defaults shown): `DELTA_BASE_URL=https://api.india.delta.exchange`,
    `DELTA_ORDER_TYPE=market_order`.
 
-### Setup — BTC/ETH/SOL Auto-Trade (no confirm tap)
+### Setup — BTC/ETH/SOL/PAXG/XAUT Auto-Trade (no confirm tap)
 
-Separate from the manual Delta button above: **entry alerts for BTC, ETH, or SOL skip
-the Telegram confirm step entirely** and place the order automatically the instant the
-webhook receives them. Everything else (Gold via Kotak, or any other symbol via the
-manual Delta button) is unaffected.
+Separate from the manual Delta button above: **entry alerts for BTC, ETH, SOL, PAXG, or
+XAUT skip the Telegram confirm step entirely** and place the order automatically the
+instant the webhook receives them. Everything else (Gold via Kotak, or any other symbol
+via the manual Delta button) is unaffected.
+
+**PAXG / XAUT** are Delta India's gold-token perpetuals — `PAXGUSD` (Pax Gold) and
+`XAUTUSD` (Tether Gold). A TradingView alert whose ticker contains `PAXG` or `XAUT`
+(e.g. `PAXGUSD.P`, `XAUTUSD.P`, with or without an exchange prefix) routes to the exact
+same auto-trade path as the crypto symbols. Note this is **not** spot gold — a plain
+`XAUUSD`/`GOLD` alert does **not** match and is left to the manual flow.
 
 ⚠️ **Read this before enabling.** Defaults are 15% of account balance as margin **per
-symbol** (so BTC+ETH+SOL firing together can use up to 45% combined), at **200x
-leverage on BTC/ETH and 100x on SOL** (Delta's actual maximums). At 200x, Delta's
-forced liquidation triggers at roughly a **0.5% adverse price move** — inside a normal
-5-minute BTC/ETH candle range. In practice this means **the exchange's liquidation
-engine, not the indicator's own stop-loss, decides the exit on most losing trades**,
-consuming the full margin on that symbol rather than the smaller loss the strategy's SL
-was sized for. This is documented in detail at the top of the AUTO-TRADE section in
-`delta_exchange_client.py`. If you want the strategy's own SL to actually govern
-outcomes instead, lower the leverage env vars below.
+symbol** (so all five firing together can use up to 75% combined), at **200x leverage on
+BTC/ETH and 100x on SOL/PAXG/XAUT** (Delta's actual maximums). At 200x, Delta's forced
+liquidation triggers at roughly a **0.5% adverse price move** — inside a normal 5-minute
+BTC/ETH candle range; even at 100x the gold tokens liquidate near a **~1% move**. In
+practice this means **the exchange's liquidation engine, not the indicator's own
+stop-loss, decides the exit on most losing trades**, consuming the full margin on that
+symbol rather than the smaller loss the strategy's SL was sized for. This is documented
+in detail at the top of the AUTO-TRADE section in `delta_exchange_client.py`. If you want
+the strategy's own SL to actually govern outcomes instead, lower the leverage env vars
+below (e.g. `DELTA_LEVERAGE_PAXG=20`).
 
 1. **Add environment variables on Render** (in addition to `DELTA_API_KEY`/`DELTA_API_SECRET` above):
    ```
@@ -274,6 +281,8 @@ outcomes instead, lower the leverage env vars below.
    DELTA_LEVERAGE_BTC=200
    DELTA_LEVERAGE_ETH=200
    DELTA_LEVERAGE_SOL=100          # Delta caps SOLUSD at 100x — 200x isn't offered there
+   DELTA_LEVERAGE_PAXG=100         # PAXGUSD gold token — Delta caps it at 100x
+   DELTA_LEVERAGE_XAUT=100         # XAUTUSD gold token — Delta caps it at 100x
    ```
    Optional (defaults shown), controlling the SL/TP attached to every auto-trade:
    ```
@@ -360,8 +369,8 @@ outcomes instead, lower the leverage env vars below.
      (resting in the orderbook) until it actually triggers. A `states=open`-only query
      could never find the SL leg, producing a false "missing" warning even when the
      order genuinely existed. Fixed to query `states=open,pending`.
-   - **Double-check `DELTA_LEVERAGE_BTC`/`_ETH`/`_SOL` are actually set to what you
-     intend.** Check `delta_auto_trade_leverage` on `/debug` — if the leverage used in a
+   - **Double-check `DELTA_LEVERAGE_BTC`/`_ETH`/`_SOL`/`_PAXG`/`_XAUT` are actually set to
+     what you intend.** Check `delta_auto_trade_leverage` on `/debug` — if the leverage used in a
      trade summary doesn't match what you configured, the env var value on Render is the
      first thing to check, not the code.
 
@@ -371,7 +380,7 @@ outcomes instead, lower the leverage env vars below.
    simple order placement — worth watching Render's logs the first few times to confirm
    it's completing well within TradingView's webhook timeout.
 
-5. **Still not automated:** TP1/TP2/TP3/SL-hit alerts for BTC/ETH/SOL remain
+5. **Still not automated:** TP1/TP2/TP3/SL-hit alerts for BTC/ETH/SOL/PAXG/XAUT remain
    notification-only for anything BEYOND the single bracket SL/TP placed at entry — e.g.
    the Pine script's SL→breakeven-at-TP1 logic doesn't get mirrored on Delta's side, and
    TP2/TP3 (if not the chosen bracket tier) don't trigger anything. The bracket SL/TP

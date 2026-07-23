@@ -5,10 +5,11 @@ Requires TradingView Essential plan (webhook alerts).
 
 Entry signals (LONG/SHORT entry alerts) are handled one of two ways:
 
-  - **BTC / ETH / SOL** -> fully automatic, no confirm tap. The instant the alert
-    arrives, delta_exchange_client.auto_place_order() sizes the position at 15% of
-    account balance as margin (independently per symbol) at a preset leverage
-    (200x BTC/ETH, 100x SOL — Delta's own max), and places the order immediately.
+  - **BTC / ETH / SOL / PAXG / XAUT** -> fully automatic, no confirm tap. The instant
+    the alert arrives, delta_exchange_client.auto_place_order() sizes the position at 15%
+    of account balance as margin (independently per symbol) at a preset leverage
+    (200x BTC/ETH, 100x SOL/PAXG/XAUT — Delta's own max), and places the order immediately.
+    (PAXGUSD / XAUTUSD are Delta India's gold-token perpetuals.)
     Telegram gets a notification AFTER the fact reporting what happened — it's not
     a gate. Still dry-run by default until LIVE_TRADING=true. See the AUTO-TRADE
     section in delta_exchange_client.py for the full risk tradeoffs of this
@@ -19,7 +20,7 @@ Entry signals (LONG/SHORT entry alerts) are handled one of two ways:
         server; tapping "Confirm & Place" calls the Kotak Neo Trade API
         (see kotak_neo_client.py). Dry-run by default until LIVE_TRADING=true.
       - "Review & Place (Delta Exchange)" -> same confirm/place flow via Delta's
-        REST API, for any symbol not covered by the BTC/ETH/SOL auto-trade path.
+        REST API, for any symbol not covered by the BTC/ETH/SOL/PAXG/XAUT auto-trade path.
       - "Open XM App" -> best-effort link to XM's app/web trading page. XM/MT5
         don't publish a deep-link format for pre-filling an order, so this only
         opens the app — you still enter the trade manually from the message text.
