@@ -16,7 +16,11 @@ Optional:
 
 Auto-trade (BTC/ETH/SOL/PAXG/XAUT only, no manual confirm — see the AUTO-TRADE section below):
   DELTA_AUTO_TRADE_CRYPTO  (default "true")
-  DELTA_CAPITAL_PCT        (default "15" — percent of balance used as margin, per symbol)
+  DELTA_CAPITAL_PCT        (default "15" — percent of TOTAL wallet balance used as margin,
+                             per symbol; computed off original balance, not the free
+                             balance, so concurrent trades each get a consistent slice)
+  DELTA_FIXED_MARGIN_USD   (default "0" = off — when > 0, use this flat USD amount as
+                             margin per trade instead of DELTA_CAPITAL_PCT)
   DELTA_LEVERAGE_BTC       (default "200")
   DELTA_LEVERAGE_ETH       (default "200")
   DELTA_LEVERAGE_SOL       (default "100" — Delta's actual max for SOLUSD)
@@ -254,10 +258,13 @@ def attach_bracket_to_position(product_id, stop_loss_price: float,
 # AUTO-TRADE: BTC / ETH / SOL / PAXG / XAUT only — no manual confirm tap.
 #
 # Triggered directly from webhook_bot.py the instant an entry alert for one of these
-# five arrives. Position size = DELTA_CAPITAL_PCT of current wallet balance (default
-# 15%), used as MARGIN, independently PER SYMBOL — so BTC, ETH, SOL, PAXG, and XAUT can
-# each use their own 15% slice of balance (up to 75% combined exposure if all five fire
-# close together). Leverage is set automatically per symbol before the order is placed.
+# five arrives. Position size = DELTA_CAPITAL_PCT of TOTAL wallet balance (default 15%),
+# used as MARGIN, independently PER SYMBOL — so BTC, ETH, SOL, PAXG, and XAUT can each use
+# their own 15% slice (up to 75% combined exposure if all five fire close together). The
+# percentage is taken off the FULL wallet balance, not the free/available balance, so if a
+# second signal fires while the first trade is still open it still gets 15% of the ORIGINAL
+# balance rather than 15% of what's left. Alternatively set DELTA_FIXED_MARGIN_USD to use a
+# flat dollar amount per trade. Leverage is set automatically per symbol before placement.
 #
 # ⚠️ LEVERAGE — EXPLICITLY CONFIRMED, NOT A DEFAULT TO TRUST BLINDLY:
 # BTCUSD/ETHUSD default to 200x (Delta's max), SOLUSD/PAXGUSD/XAUTUSD to 100x (Delta's
@@ -295,7 +302,25 @@ AUTO_CRYPTO_SYMBOLS = {
 }
 
 AUTO_TRADE_ENABLED = os.environ.get("DELTA_AUTO_TRADE_CRYPTO", "true").strip().lower() == "true"
+
+# ---- POSITION SIZING (margin used per trade, per symbol) ----
+# Two ways to size, checked in this order:
+#
+#   1. DELTA_FIXED_MARGIN_USD (default "0" = off). When > 0 this OVERRIDES the percentage:
+#      every auto-trade uses EXACTLY this many USD as margin, regardless of balance. Use
+#      this when you want to say "invest $X per trade" and have it stay $X no matter how
+#      many trades are already open.
+#
+#   2. DELTA_CAPITAL_PCT (default "15"). Percent of TOTAL wallet balance used as margin.
+#      Computed off the FULL wallet equity (locked margin + free), NOT the free/available
+#      balance — so if a second signal fires while the first trade is still open, it still
+#      gets 15% of the ORIGINAL balance, not 15% of what's left after the first trade. This
+#      is the fix for "trade 2 took 15% of $80 instead of 15% of $100".
+#
+# Either way the trade is SKIPPED (not resized down) if the required margin exceeds the
+# free/available balance — i.e. you've run out of un-committed capital.
 CAPITAL_PCT = float(os.environ.get("DELTA_CAPITAL_PCT", "15"))
+FIXED_MARGIN_USD = float(os.environ.get("DELTA_FIXED_MARGIN_USD", "0"))
 
 DEFAULT_LEVERAGE = {
     "BTCUSD": int(os.environ.get("DELTA_LEVERAGE_BTC", "200")),
@@ -415,11 +440,24 @@ def _entry_is_filled(order_obj: dict) -> bool:
     return False
 
 
-def get_available_balance_usd() -> float:
-    """Delta's crypto perpetuals (BTCUSD/ETHUSD/SOLUSD) are USDT-margined even on the
+def get_wallet_balances_usd() -> tuple:
+    """Returns (total_balance, available_balance) for the USDT/USD wallet, both in USD.
+
+    Delta's crypto perpetuals (BTCUSD/ETHUSD/SOLUSD) are USDT-margined even on the
     India entity (INR is just the UPI deposit rail), so this looks for the USDT wallet
     entry specifically. Raises loudly on any unexpected shape rather than silently
-    returning a wrong number — see the TESTNET note above."""
+    returning a wrong number — see the TESTNET note above.
+
+    Why BOTH numbers matter for sizing:
+      * total_balance ("balance")            — full wallet equity, INCLUDING the margin
+        currently locked in open positions. Stays put when a position opens.
+      * available_balance ("available_balance") — only the FREE portion; it SHRINKS every
+        time a position locks margin.
+    Percentage sizing is computed off `total_balance` so that N concurrent positions each
+    get a consistent slice of the ORIGINAL capital. If it used available_balance, a second
+    signal firing while the first trade is still open would size off the leftover (e.g. 15%
+    of the remaining $80 instead of 15% of the original $100). available_balance is returned
+    too, purely as a can-we-actually-afford-this-margin guard."""
     data = _get("/v2/wallet/balances")
     balances = data.get("result", data) if isinstance(data, dict) else data
     if not isinstance(balances, list):
@@ -427,9 +465,14 @@ def get_available_balance_usd() -> float:
     for b in balances:
         asset_symbol = (b.get("asset_symbol") or "").upper()
         if asset_symbol in ("USDT", "USD"):
-            bal = b.get("available_balance", b.get("balance"))
-            if bal is not None:
-                return float(bal)
+            total = b.get("balance", b.get("available_balance"))
+            avail = b.get("available_balance", total)
+            if total is not None:
+                total_f = float(total)
+                # Fall back to total if available_balance is missing, and never report
+                # available as larger than total.
+                avail_f = min(float(avail), total_f) if avail is not None else total_f
+                return total_f, avail_f
     raise RuntimeError(f"Could not find a USDT/USD balance entry in wallet response: {balances}")
 
 
@@ -602,11 +645,14 @@ def auto_place_order(delta_symbol: str, side: str, sl: float = None, tp: float =
     else:
         entry_desc = "market"
 
+    sizing_desc = (f"${FIXED_MARGIN_USD:.2f} fixed margin" if FIXED_MARGIN_USD > 0
+                   else f"{CAPITAL_PCT}% of total balance as margin")
+
     if not LIVE_TRADING:
         # Dry run makes zero external API calls (same policy as place_order) — so this
         # can't validate the sizing math end-to-end. Use Delta's testnet for that.
         summary = (f"[DRY RUN] Would auto-place {side} on {delta_symbol} ({entry_desc} entry) using "
-                   f"{CAPITAL_PCT}% of balance as margin at {leverage}x leverage{bracket_desc}. "
+                   f"{sizing_desc} at {leverage}x leverage{bracket_desc}. "
                    f"Set LIVE_TRADING=true (ideally against testnet first) to see real numbers.")
         return {"ok": True, "dry_run": True, "raw": None, "error": None, "summary": summary}
 
@@ -615,7 +661,7 @@ def auto_place_order(delta_symbol: str, side: str, sl: float = None, tp: float =
         return {"ok": False, "dry_run": False, "raw": None, "error": err, "summary": err}
 
     try:
-        balance = get_available_balance_usd()
+        total_balance, available_balance = get_wallet_balances_usd()
         product = get_product_info(delta_symbol)
         product_id = product["id"]
         contract_value = float(product.get("contract_value") or 0)
@@ -626,18 +672,39 @@ def auto_place_order(delta_symbol: str, side: str, sl: float = None, tp: float =
         set_leverage(product_id, leverage)
 
         mark_price = get_mark_price(delta_symbol)
-        margin = balance * (CAPITAL_PCT / 100)
+
+        # ---- Position sizing (margin per trade) ----
+        # FIXED_MARGIN_USD wins when set (> 0): a flat dollar amount per trade. Otherwise
+        # a percentage of TOTAL wallet balance (locked + free), NOT the free balance — so
+        # a second concurrent signal still gets its full CAPITAL_PCT of the ORIGINAL
+        # capital instead of a shrinking slice of whatever's left. See the config notes.
+        if FIXED_MARGIN_USD > 0:
+            margin = FIXED_MARGIN_USD
+            basis_desc = f"${margin:.2f} fixed"
+        else:
+            margin = total_balance * (CAPITAL_PCT / 100)
+            basis_desc = f"{CAPITAL_PCT:.0f}% of ${total_balance:.2f} balance"
+
+        # Since we size off TOTAL balance, the free balance can be too thin to actually
+        # post this margin (e.g. earlier concurrent trades already locked most of it).
+        # Skip cleanly instead of letting Delta reject it with "insufficient_margin".
+        if margin > available_balance:
+            err = (f"Need ${margin:.2f} margin for {delta_symbol} ({basis_desc}) but only "
+                   f"${available_balance:.2f} is free (the rest is locked in open positions) "
+                   f"— trade skipped. Out of un-committed capital.")
+            return {"ok": False, "dry_run": False, "raw": None, "error": err, "summary": err}
+
         notional = margin * leverage
         contracts = int(notional / mark_price / contract_value)
 
         if contracts < 1:
-            err = (f"Computed size < 1 contract for {delta_symbol} (balance=${balance:.2f}, "
-                   f"margin=${margin:.2f}, leverage={leverage}x, notional=${notional:.2f}, "
+            err = (f"Computed size < 1 contract for {delta_symbol} (margin=${margin:.2f} "
+                   f"[{basis_desc}], leverage={leverage}x, notional=${notional:.2f}, "
                    f"price=${mark_price}, contract_value={contract_value}) — trade skipped.")
             return {"ok": False, "dry_run": False, "raw": None, "error": err, "summary": err}
 
         prefix = (f"AUTO {side.upper()} {contracts} x {delta_symbol} @ ~${mark_price:.2f} | "
-                  f"margin ${margin:.2f} ({CAPITAL_PCT:.0f}% of ${balance:.2f} balance) "
+                  f"margin ${margin:.2f} ({basis_desc}) "
                   f"@ {leverage}x = ${notional:.2f} notional{bracket_desc}. ")
 
         # ---- Pre-entry sanity check: is the protection still on the right side of the
